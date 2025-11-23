@@ -116,6 +116,8 @@ class HeterPyramidCollab(nn.Module):
         self.model_train_init()
         # check again which module is not fixed.
         check_trainable_module(self)
+        self.record_runtime_features = False
+        self._runtime_feature_store = {}
 
 
     def model_train_init(self):
@@ -177,6 +179,12 @@ class HeterPyramidCollab(nn.Module):
             counting_dict[modality_name] += 1
 
         heter_feature_2d = torch.stack(heter_feature_2d_list)
+        if self.record_runtime_features:
+            self._runtime_feature_store = {
+                'agent_bev': heter_feature_2d.detach().cpu(),
+                'record_len': record_len.detach().cpu() if torch.is_tensor(record_len) else record_len,
+                'agent_modality_list': list(agent_modality_list),
+            }
         
         if self.compress:
             heter_feature_2d = self.compressor(heter_feature_2d)
@@ -191,6 +199,11 @@ class HeterPyramidCollab(nn.Module):
                                                 agent_modality_list, 
                                                 self.cam_crop_info
                                             )
+        if self.record_runtime_features:
+            self._runtime_feature_store.update({
+                'occ_map_list': [occ.detach().cpu() for occ in occ_outputs],
+                'fused_feature': fused_feature.detach().cpu(),
+            })
 
         if self.shrink_flag:
             fused_feature = self.shrink_conv(fused_feature)
