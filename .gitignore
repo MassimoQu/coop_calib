@@ -132,6 +132,7 @@ dmypy.json
 logs/
 *.c
 *.so
+*.pth
 .idea
 
 opv2v_data_dumping
@@ -163,3 +164,4 @@ opencood/tools/save_params.py
 ./vscode
 .vscode
 opencood/tools/inference_w_noise_heter.py
+opencood/pose/pgc_outputs/

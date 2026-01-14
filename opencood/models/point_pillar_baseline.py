@@ -11,6 +11,7 @@ from opencood.models.sub_modules.base_bev_backbone_resnet import ResNetBEVBackbo
 from opencood.models.sub_modules.downsample_conv import DownsampleConv
 from opencood.models.sub_modules.naive_compress import NaiveCompressor
 from opencood.models.fuse_modules.fusion_in_one import MaxFusion, AttFusion, DiscoFusion, V2VNetFusion, V2XViTFusion
+from opencood.models.fuse_modules.pastat_fusion import PASTATFusion
 from opencood.utils.transformation_utils import normalize_pairwise_tfm
 
 class PointPillarBaseline(nn.Module):
@@ -32,16 +33,20 @@ class PointPillarBaseline(nn.Module):
             self.backbone = BaseBEVBackbone(args['base_bev_backbone'], 64) # or you can use ResNetBEVBackbone, which is stronger
         self.voxel_size = args['voxel_size']
 
-        if args['fusion_method'] == "max":
+        self.fusion_method = args['fusion_method']
+
+        if self.fusion_method == "max":
             self.fusion_net = MaxFusion()
-        if args['fusion_method'] == "att":
+        if self.fusion_method == "att":
             self.fusion_net = AttFusion(args['att']['feat_dim'])
-        if args['fusion_method'] == "disconet":
+        if self.fusion_method == "disconet":
             self.fusion_net = DiscoFusion(args['disconet']['feat_dim'])
-        if args['fusion_method'] == "v2vnet":
+        if self.fusion_method == "v2vnet":
             self.fusion_net = V2VNetFusion(args['v2vnet'])
-        if args['fusion_method'] == 'v2xvit':
+        if self.fusion_method == 'v2xvit':
             self.fusion_net = V2XViTFusion(args['v2xvit'])
+        if self.fusion_method == 'pastat':
+            self.fusion_net = PASTATFusion(args['pastat'])
 
         self.out_channel = sum(args['base_bev_backbone']['num_upsample_filter'])
 
@@ -120,6 +125,14 @@ class PointPillarBaseline(nn.Module):
 
         if self.compression:
             spatial_features_2d = self.naive_compressor(spatial_features_2d)
+
+        if self.fusion_method == 'pastat':
+            pose_conf = data_dict.get('pose_confidence')
+            if pose_conf is None:
+                pose_conf = spatial_features_2d.new_ones((spatial_features_2d.shape[0],))
+            pose_conf = pose_conf.to(dtype=spatial_features_2d.dtype, device=spatial_features_2d.device).view(-1, 1, 1, 1)
+            conf_map = pose_conf.expand(-1, 1, spatial_features_2d.shape[2], spatial_features_2d.shape[3])
+            spatial_features_2d = torch.cat([spatial_features_2d, conf_map], dim=1)
 
         fused_feature = self.fusion_net(spatial_features_2d, record_len, affine_matrix)
 

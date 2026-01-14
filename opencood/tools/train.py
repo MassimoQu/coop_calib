@@ -5,7 +5,9 @@
 import argparse
 import os
 import statistics
+import warnings
 
+import yaml
 import torch
 from torch.utils.data import DataLoader, Subset
 from tensorboardX import SummaryWriter
@@ -16,6 +18,8 @@ from opencood.data_utils.datasets import build_dataset
 
 from icecream import ic
 
+warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"shapely\\..*")
+warnings.filterwarnings("ignore", message=r".*invalid value encountered in intersection.*", category=RuntimeWarning)
 
 def train_parser():
     parser = argparse.ArgumentParser(description="synthetic data generation")
@@ -23,6 +27,34 @@ def train_parser():
                         help='data generation yaml file needed ')
     parser.add_argument('--model_dir', default='',
                         help='Continued training path')
+    parser.add_argument(
+        '--init_model_dir',
+        default='',
+        help='Initialize weights from a checkpoint directory, but start a new run (do not resume epoch/optimizer).',
+    )
+    parser.add_argument(
+        '--max_train_steps',
+        type=int,
+        default=0,
+        help='Optional cap on train steps per epoch (debug only). 0 means no cap.',
+    )
+    parser.add_argument(
+        '--max_epochs',
+        type=int,
+        default=0,
+        help='Optional cap on total epochs to run (debug only). 0 means no cap.',
+    )
+    parser.add_argument(
+        '--max_val_steps',
+        type=int,
+        default=0,
+        help='Optional cap on validation steps per eval (debug only). 0 means no cap.',
+    )
+    parser.add_argument(
+        '--no_test',
+        action='store_true',
+        help='Skip running inference.py after training finishes.',
+    )
     parser.add_argument('--fusion_method', '-f', default="intermediate",
                         help='passed to inference.')
     opt = parser.parse_args()
@@ -72,20 +104,44 @@ def main():
     # lr scheduler setup
     
 
-    # if we want to train from last checkpoint.
+    # Resume from last checkpoint OR initialize weights from another run.
     if opt.model_dir:
         saved_path = opt.model_dir
-        init_epoch, model = train_utils.load_saved_model(saved_path, model)
-        lowest_val_epoch = init_epoch
-        scheduler = train_utils.setup_lr_schedular(hypes, optimizer, init_epoch=init_epoch)
-        print(f"resume from {init_epoch} epoch.")
+        if opt.init_model_dir:
+            _loaded_epoch, model = train_utils.load_saved_model(opt.init_model_dir, model)
+            print(f"initialized model weights from {opt.init_model_dir} (checkpoint epoch {_loaded_epoch}).")
+            init_epoch = 0
+            scheduler = train_utils.setup_lr_schedular(hypes, optimizer, init_epoch=init_epoch)
+        else:
+            # Resume training from the latest epoch checkpoint (do not roll back to bestval).
+            init_epoch, model = train_utils.load_latest_model(saved_path, model)
+            lowest_val_epoch = init_epoch
+            scheduler = train_utils.setup_lr_schedular(hypes, optimizer, init_epoch=init_epoch)
+            print(f"resume from {init_epoch} epoch.")
 
     else:
+        # Optionally initialize model weights from another checkpoint, but start a new run.
+        if opt.init_model_dir:
+            _loaded_epoch, model = train_utils.load_saved_model(opt.init_model_dir, model)
+            print(f"initialized model weights from {opt.init_model_dir} (checkpoint epoch {_loaded_epoch}).")
         init_epoch = 0
         # if we train the model from scratch, we need to create a folder
         # to save the model,
         saved_path = train_utils.setup_train(hypes)
         scheduler = train_utils.setup_lr_schedular(hypes, optimizer)
+
+    # If a user provided an explicit --model_dir for a *new* run, config.yaml may
+    # not exist yet (yaml_utils.load_yaml falls back to -y in that case). Save
+    # a resolved config + scripts snapshot for reproducibility.
+    os.makedirs(saved_path, exist_ok=True)
+    config_path = os.path.join(saved_path, "config.yaml")
+    if not os.path.exists(config_path):
+        try:
+            with open(config_path, "w") as f:
+                yaml.dump(hypes, f)
+            train_utils.backup_script(saved_path)
+        except Exception as e:
+            print(f"warning: failed to write config/scripts snapshot to {saved_path}: {e}")
 
     # we assume gpu is necessary
     if torch.cuda.is_available():
@@ -95,7 +151,9 @@ def main():
     writer = SummaryWriter(saved_path)
 
     print('Training start')
-    epoches = hypes['train_params']['epoches']
+    epoches = int(hypes['train_params']['epoches'])
+    if opt.max_epochs:
+        epoches = min(epoches, int(opt.max_epochs))
     supervise_single_flag = False if not hasattr(opencood_train_dataset, "supervise_single") else opencood_train_dataset.supervise_single
     # used to help schedule learning rate
 
@@ -111,6 +169,8 @@ def main():
         for i, batch_data in enumerate(train_loader):
             if batch_data is None or batch_data['ego']['object_bbx_mask'].sum()==0:
                 continue
+            if opt.max_train_steps and i >= opt.max_train_steps:
+                break
             model.zero_grad()
             optimizer.zero_grad()
             batch_data = train_utils.to_device(batch_data, device)
@@ -142,6 +202,8 @@ def main():
                 for i, batch_data in enumerate(val_loader):
                     if batch_data is None:
                         continue
+                    if opt.max_val_steps and i >= opt.max_val_steps:
+                        break
                     model.zero_grad()
                     optimizer.zero_grad()
                     model.eval()
@@ -178,7 +240,7 @@ def main():
 
     print('Training Finished, checkpoints saved to %s' % saved_path)
 
-    run_test = True
+    run_test = not bool(opt.no_test)
     if run_test:
         fusion_method = opt.fusion_method
         cmd = f"python opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"

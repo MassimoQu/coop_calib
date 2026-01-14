@@ -85,7 +85,7 @@ class UncertaintyVoxelPostprocessor(VoxelPostprocessor):
             scores = pred_box2d_score_tensor[:, -1]
 
         else:
-             return None, None, None
+             return None, None, None, None
 
         # divide boxes to each cav
 
@@ -99,6 +99,8 @@ class UncertaintyVoxelPostprocessor(VoxelPostprocessor):
             cur_boxes = pred_box3d_original[cur_idx: cur_idx+n]
             cur_scores = scores[cur_idx:cur_idx+n]
             cur_uncertainty = uncertainty[cur_idx: cur_idx+n]
+            if self.params.get('order') == 'hwl':
+                cur_boxes = cur_boxes[:, [0, 1, 2, 5, 4, 3, 6]]
             # nms
             keep_index = box_utils.nms_rotated(cur_corners,
                                                cur_scores,
@@ -110,7 +112,7 @@ class UncertaintyVoxelPostprocessor(VoxelPostprocessor):
             batch_uncertainty.append(cur_uncertainty[keep_index])
             cur_idx += n
 
-        return batch_pred_corners3d, batch_pred_boxes3d, batch_uncertainty
+        return batch_pred_corners3d, batch_pred_boxes3d, batch_uncertainty, batch_scores
 
 
     def post_process(self, data_dict, output_dict, return_uncertainty=False):
@@ -247,4 +249,3 @@ class UncertaintyVoxelPostprocessor(VoxelPostprocessor):
             return pred_box3d_tensor, scores, uncertainty
 
         return pred_box3d_tensor, scores
-

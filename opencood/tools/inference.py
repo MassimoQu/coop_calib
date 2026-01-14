@@ -26,11 +26,17 @@ def test_parser():
     parser.add_argument('--fusion_method', type=str,
                         default='intermediate',
                         help='no, no_w_uncertainty, late, early or intermediate')
-    parser.add_argument('--save_vis_interval', type=int, default=40,
-                        help='interval of saving visualization')
+    parser.add_argument(
+        '--save_vis_interval',
+        type=int,
+        default=0,
+        help='interval of saving visualization (0 disables saving)',
+    )
     parser.add_argument('--save_npy', action='store_true',
                         help='whether to save prediction and gt result'
                              'in npy file')
+    parser.add_argument('--max_samples', type=int, default=None,
+                        help='Limit number of samples for quick evaluation')
     parser.add_argument('--range', type=str, default="102.4,102.4",
                         help="detection range is [-102.4, +102.4, -102.4, +102.4]")
     parser.add_argument('--no_score', action='store_true',
@@ -108,10 +114,14 @@ def main():
     
     # build dataset for each noise setting
     print('Dataset Building')
-    opencood_dataset = build_dataset(hypes, visualize=True, train=False)
-    # opencood_dataset_subset = Subset(opencood_dataset, range(640,2100))
-    # data_loader = DataLoader(opencood_dataset_subset,
-    data_loader = DataLoader(opencood_dataset,
+    need_origin_lidar = bool(opt.save_npy) or int(opt.save_vis_interval) > 0
+    opencood_dataset = build_dataset(hypes, visualize=need_origin_lidar, train=False)
+    dataset_for_loader = opencood_dataset
+    if opt.max_samples is not None:
+        max_samples = max(int(opt.max_samples), 0)
+        dataset_for_loader = Subset(opencood_dataset, range(min(max_samples, len(opencood_dataset))))
+
+    data_loader = DataLoader(dataset_for_loader,
                             batch_size=1,
                             num_workers=4,
                             collate_fn=opencood_dataset.collate_batch_test,
@@ -127,9 +137,15 @@ def main():
     
     infer_info = opt.fusion_method + opt.note
 
+    total_samples = len(dataset_for_loader)
+    log_every = int(getattr(opt, "log_every", 50) or 0)
+    if log_every <= 0:
+        log_every = 50
+
 
     for i, batch_data in enumerate(data_loader):
-        print(f"{infer_info}_{i}")
+        if i % log_every == 0 or i == total_samples - 1:
+            print(f"{infer_info}: {i + 1}/{total_samples}")
         if batch_data is None:
             continue
         with torch.no_grad():
@@ -202,7 +218,7 @@ def main():
                 infer_result.update({"cav_box_np": cav_box_np, \
                                      "agent_modality_list": agent_modality_list})
 
-            if (i % opt.save_vis_interval == 0) and (pred_box_tensor is not None or gt_box_tensor is not None):
+            if int(opt.save_vis_interval) > 0 and (i % opt.save_vis_interval == 0) and (pred_box_tensor is not None or gt_box_tensor is not None):
                 vis_save_path_root = os.path.join(opt.model_dir, f'vis_{infer_info}')
                 if not os.path.exists(vis_save_path_root):
                     os.makedirs(vis_save_path_root)

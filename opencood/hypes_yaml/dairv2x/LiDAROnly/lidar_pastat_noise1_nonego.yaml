@@ -1,0 +1,203 @@
+name: HeterBaseline_DAIR_lidar_pastat_noise1_nonego
+data_dir: "dataset/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure"
+root_dir: "dataset/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/train.json"
+validate_dir: "dataset/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/val.json"
+test_dir: "dataset/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/val.json"
+
+
+yaml_parser: "load_general_params"
+train_params:
+  batch_size: &batch_size 2
+  epoches: 60
+  eval_freq: 2
+  save_freq: 2
+  max_cav: 2
+
+comm_range: 100
+input_source: ['lidar']
+label_type: 'lidar'
+cav_lidar_range: &cav_lidar [-102.4, -51.2, -3.5, 102.4, 51.2, 1.5]
+
+noise_setting:
+  add_noise: true
+  args:
+    pos_std: 1.0
+    rot_std: 1.0
+    pos_mean: 0.0
+    rot_mean: 0.0
+    target: non-ego
+
+heter:
+  assignment_path: null
+  ego_modality: &ego_modality "m1"
+  mapping_dict:
+    m1: m1
+    m2: m1
+  modality_setting:
+    m1:
+      sensor_type: &sensor_type_m1 'lidar'
+      core_method: &core_method_m1 "point_pillar"
+
+      # lidar requires preprocess
+      preprocess:
+        core_method: 'SpVoxelPreprocessor'
+        args:
+          voxel_size: &voxel_size [0.4, 0.4, 4]
+          max_points_per_voxel: 32
+          max_voxel_train: 32000
+          max_voxel_test: 70000
+        cav_lidar_range: *cav_lidar
+
+fusion:
+  core_method: 'intermediateheter'
+  dataset: 'dairv2x'
+  args:
+    proj_first: false
+    grid_conf: None # place-holder
+    data_aug_conf: None # place-holder
+
+data_augment:
+  - NAME: random_world_flip
+    ALONG_AXIS_LIST: [ 'x' ]
+
+  - NAME: random_world_rotation
+    WORLD_ROT_ANGLE: [ -0.78539816, 0.78539816 ]
+
+  - NAME: random_world_scaling
+    WORLD_SCALE_RANGE: [ 0.95, 1.05 ]
+
+preprocess:
+  core_method: 'SpVoxelPreprocessor'
+  args:
+    voxel_size: [0.4, 0.4, 4] # useful
+    max_points_per_voxel: 1 # useless
+    max_voxel_train: 1 # useless
+    max_voxel_test: 1 # useless
+  cav_lidar_range: *cav_lidar
+
+postprocess:
+  core_method: 'VoxelPostprocessor'
+  gt_range: *cav_lidar
+  max_num: 150
+  order: 'hwl'
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: [0, 90]
+    num: &anchor_num 2
+    feature_stride: 2
+  target_args:
+    pos_threshold: 0.6
+    neg_threshold: 0.45
+    score_threshold: 0.2
+
+model:
+  core_method: intermediateheter
+  args:
+    ego_modality: *ego_modality
+    lidar_range: *cav_lidar
+    anchor_number: *anchor_num
+    fusion_method: pastat
+    in_head: 256
+
+    m1:
+      core_method: point_pillar
+      sensor_type: *sensor_type_m1
+      encoder_args:
+        voxel_size: *voxel_size
+        lidar_range: *cav_lidar
+        pillar_vfe:
+          use_norm: true
+          with_distance: false
+          use_absolute_xyz: true
+          num_filters: [64]
+        point_pillar_scatter:
+          num_features: 64
+
+      backbone_args:
+        layer_nums: [3, 5, 8]
+        layer_strides: [2, 2, 2]
+        num_filters: [64, 128, 256]
+        upsample_strides: [1, 2, 4]
+        num_upsample_filter: [128, 128, 128]
+
+      shrink_header:
+        input_dim: 384
+        kernal_size: [3]
+        dim: [256]
+        stride: [2]
+        padding: [1]
+
+    pastat:
+      use_pose_confidence: true
+      drop_confidence_channel: true
+      confidence_embedding:
+        embed_dim: 8
+      fsa:
+        hidden_channels: 128
+        mlp_hidden: 128
+        trans_limit: 8.0
+        rot_limit_deg: 10.0
+      transformer:
+        encoder:
+          num_blocks: 1
+          depth: 3
+          cav_att_config:
+            dim: 256
+            heads: 8
+            dim_head: 32
+            dropout: 0.3
+            use_RTE: false
+            RTE_ratio: 0
+            use_hetero: true
+          pwindow_att_config:
+            dim: 256
+            heads: [16, 8, 4]
+            dim_head: [16, 32, 64]
+            dropout: 0.3
+            fusion_method: split_attn
+          feed_forward:
+            mlp_dim: 256
+            dropout: 0.3
+          RTE_ratio: 0
+
+loss:
+  core_method: point_pillar_depth_loss
+  args:
+    cls:
+      type: SigmoidFocalLoss
+      alpha: 0.25
+      gamma: 2.0
+      weight: 1.0
+    reg:
+      type: WeightedSmoothL1Loss
+      sigma: 3.0
+      weight: 2.0
+      codewise: true
+    dir:
+      type: WeightedSoftmaxClassificationLoss
+      args:
+        num_bins: 2
+        dir_offset: 0.7853
+        anchor_yaw: [0, 90]
+      weight: 0.2
+    iou:
+      weight: 0.0
+    depth:
+      weight: 1.0
+    pos_cls_weight: 2.0
+
+optimizer:
+  core_method: Adam
+  lr: 0.001
+  args:
+    eps: 1e-10
+    weight_decay: 1e-4
+
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size: [15, 50]
+

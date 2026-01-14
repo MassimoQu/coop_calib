@@ -28,13 +28,14 @@ class LiftSplatShoot(nn.Module):
                                 self.grid_conf['zbound'],
                                 )  # 划分网格
 
-        self.dx = dx.clone().detach().requires_grad_(False).to(torch.device("cuda"))  # [0.4,0.4,20]
-        self.bx = bx.clone().detach().requires_grad_(False).to(torch.device("cuda"))  # [-49.8,-49.8,0]
-        self.nx = nx.clone().detach().requires_grad_(False).to(torch.device("cuda"))  # [250,250,1]
+        # Register as buffers so they follow the module device (CPU/GPU).
+        self.register_buffer("dx", dx.clone().detach())  # [0.4,0.4,20]
+        self.register_buffer("bx", bx.clone().detach())  # [-49.8,-49.8,0]
+        self.register_buffer("nx", nx.clone().detach())  # [250,250,1]
         
         self.downsample = args['img_downsample']  # 下采样倍数
         self.camC = args['img_features']  # 图像特征维度
-        self.frustum = self.create_frustum().clone().detach().requires_grad_(False).to(torch.device("cuda"))  # frustum: DxfHxfWx3(41x8x16x3)
+        self.register_buffer("frustum", self.create_frustum().clone().detach())  # frustum: DxfHxfWx3(41x8x16x3)
 
         self.D, _, _, _ = self.frustum.shape  # D: 41
         self.camera_encoder_type = args['camera_encoder']

@@ -35,6 +35,8 @@ def train_parser():
                         help="Optional override for stage1 box export directory.")
     parser.add_argument("--splits", type=str, default="train,val,test",
                         help="Comma separated dataset splits to export (default: train,val,test).")
+    parser.add_argument("--test_dir_override", type=str, default=None,
+                        help="Optional override for hypes['test_dir'] (useful for exporting custom frame lists).")
     parser.add_argument("--comm_range_override", type=float, default=None,
                         help="Override comm_range to force exporting all agents (useful for detection cache generation).")
     parser.add_argument("--force_ego_cav", type=str, default=None,
@@ -76,10 +78,28 @@ def train_parser():
                         help="Pyramid level index (0=highest resolution) used for peak extraction.")
     parser.add_argument("--bev_feature_score_min", type=float, default=0.3,
                         help="Minimum sigmoid score for BEV feature peaks.")
+    parser.add_argument(
+        "--bev_peak_score_source",
+        type=str,
+        default="bev_norm",
+        choices=["bev_norm", "occ"],
+        help="Score map used to select BEV peaks. "
+             "'bev_norm' uses per-agent BEV feature L2 norm (does not require cross-agent alignment). "
+             "'occ' uses occ_map_list from PyramidFusion (may depend on pairwise transforms).",
+    )
     parser.add_argument("--bev_descriptor_dim", type=int, default=32,
-                        help="(deprecated) kept for backward compatibility; shape descriptors ignore this.")
+                        help="Descriptor dimension for BEV embedding (0 uses full channel size).")
+    parser.add_argument(
+        "--bev_descriptor_mode",
+        type=str,
+        default="neighbor",
+        choices=["neighbor", "bev", "bev+neighbor"],
+        help="Descriptor source for BEV peaks/detections: "
+             "'neighbor' uses nearest-neighbor distances, 'bev' uses BEV feature embedding, "
+             "'bev+neighbor' concatenates both.",
+    )
     parser.add_argument("--bev_descriptor_norm", action='store_true',
-                        help="(deprecated) kept for backward compatibility.")
+                        help="L2-normalize BEV embedding descriptors (when bev descriptor is enabled).")
     parser.add_argument("--bev_feature_box_dims", type=float, nargs=3, default=(0.6, 0.6, 0.5),
                         metavar=('L', 'W', 'H'),
                         help="Micro-box dimensions for BEV feature peaks.")
@@ -89,6 +109,16 @@ def train_parser():
                         help="Number of nearest-neighbor distances to encode as descriptor.")
     parser.add_argument("--bev_descriptor_on_detections", action='store_true',
                         help="Attach BEV descriptors to detection boxes in pred_corner3d_np_list.")
+    parser.add_argument(
+        "--dump_occ_map",
+        action='store_true',
+        help="Dump dense occ_map_level0 into stage1_boxes.json (very large).",
+    )
+    parser.add_argument(
+        "--dump_occ_map_path",
+        action="store_true",
+        help="Store occ_map_level0 as separate .npz files and write occ_map_level0_path into stage1_boxes.json (recommended).",
+    )
     parser.add_argument("--max_export_samples", type=int, default=None,
                         help="Optional limit on number of samples to export per split (useful for quick tests).")
     opt = parser.parse_args()
@@ -214,7 +244,14 @@ def _apply_neighbor_descriptor(entries, neighbor_k):
                 dists = pad
             else:
                 dists = dists[:neighbor_k]
-            feat['descriptor'] = dists.tolist()
+            desc = dists.tolist()
+            existing = feat.get('descriptor')
+            if existing is None:
+                feat['descriptor'] = desc
+            elif isinstance(existing, (list, tuple)):
+                feat['descriptor'] = list(existing) + desc
+            else:
+                feat['descriptor'] = desc
     return entries
 
 
@@ -224,48 +261,82 @@ def _extract_bev_feature_peaks(runtime_store, cav_range, cfg):
     bev_tensor = runtime_store.get('agent_bev')
     occ_map_list = runtime_store.get('occ_map_list')
     record_len = runtime_store.get('record_len')
-    if bev_tensor is None or occ_map_list is None:
+    if bev_tensor is None:
         return None
     record_len_list = _record_len_to_list(record_len)
     total_agents = bev_tensor.shape[0]
     if not record_len_list:
         record_len_list = [total_agents]
     level = int(cfg.get('level', 0))
-    level = max(0, min(level, len(occ_map_list) - 1))
-    occ_tensor = occ_map_list[level]
-    if occ_tensor.shape[0] != total_agents:
-        # fall back to broadcasting if pyramid level omits agents
-        occ_tensor = occ_tensor[:total_agents]
+    peak_score_source = str(cfg.get('peak_score_source', 'bev_norm')).lower()
+    if peak_score_source == 'occ':
+        if not occ_map_list:
+            return None
+        level = max(0, min(level, len(occ_map_list) - 1))
+        occ_tensor = occ_map_list[level]
+        if occ_tensor.shape[0] != total_agents:
+            # fall back to broadcasting if pyramid level omits agents
+            occ_tensor = occ_tensor[:total_agents]
+    else:
+        occ_tensor = None
     extent_x = cav_range[3] - cav_range[0]
     extent_y = cav_range[4] - cav_range[1]
     topk = int(cfg.get('topk', 0))
     min_score = float(cfg.get('score_min', 0.0))
     box_dims = tuple(cfg.get('box_dims', (0.6, 0.6, 0.5)))
     min_sep = int(cfg.get('min_separation', 0))
+    descriptor_dim = int(cfg.get('descriptor_dim', 0))
+    descriptor_norm = bool(cfg.get('descriptor_norm', False))
+    descriptor_mode = str(cfg.get('descriptor_mode', 'neighbor')).lower()
+    use_bev_descriptor = 'bev' in descriptor_mode
+    use_neighbor_descriptor = 'neighbor' in descriptor_mode
     neighbor_k = max(1, int(cfg.get('neighbor_k', 6)))
     per_agent_entries = []
-    _, _, occ_H, occ_W = occ_tensor.shape
     _, _, feat_H, feat_W = bev_tensor.shape
     for agent_idx in range(total_agents):
-        occ_map = occ_tensor[agent_idx, 0]
-        scores = torch.sigmoid(occ_map).reshape(-1)
-        k = min(topk, scores.shape[0])
+        feat_map = bev_tensor[agent_idx]
+        if peak_score_source == 'occ' and occ_tensor is not None:
+            _, _, occ_H, occ_W = occ_tensor.shape
+            score_map = torch.sigmoid(occ_tensor[agent_idx, 0]).float()
+            grid_H, grid_W = int(occ_H), int(occ_W)
+            if (feat_H, feat_W) != (grid_H, grid_W):
+                feat_map = F.interpolate(
+                    feat_map.unsqueeze(0),
+                    size=(grid_H, grid_W),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0)
+        else:
+            score_map = torch.norm(feat_map.float(), dim=0)
+            score_min = float(score_map.min().detach().cpu().item())
+            score_max = float(score_map.max().detach().cpu().item())
+            if score_max > score_min:
+                score_map = (score_map - score_min) / (score_max - score_min + 1e-6)
+            else:
+                score_map = score_map * 0.0
+            grid_H, grid_W = int(feat_map.shape[-2]), int(feat_map.shape[-1])
+
+        scores = score_map.reshape(-1)
+        k = min(topk, int(scores.shape[0]))
         if k <= 0:
             per_agent_entries.append([])
             continue
         values, indices = torch.topk(scores, k=k)
-        feat_map = bev_tensor[agent_idx]
-        if (feat_H, feat_W) != (occ_H, occ_W):
-            feat_map = F.interpolate(feat_map.unsqueeze(0), size=(occ_H, occ_W), mode='bilinear', align_corners=False).squeeze(0)
-        x_res = extent_x / occ_W
-        y_res = extent_y / occ_H
+        if use_bev_descriptor:
+            channels = int(feat_map.shape[0])
+            if descriptor_dim <= 0 or descriptor_dim > channels:
+                descriptor_dim_eff = channels
+                channel_idx = None
+            else:
+                descriptor_dim_eff = descriptor_dim
+                channel_idx = torch.linspace(0, channels - 1, steps=descriptor_dim_eff, device=feat_map.device).long()
         agent_features = []
         selected_coords = []
         for value, index in zip(values.tolist(), indices.tolist()):
             if value < min_score:
                 break
-            row = index // occ_W
-            col = index % occ_W
+            row = index // grid_W
+            col = index % grid_W
             if min_sep > 0:
                 too_close = False
                 for r_sel, c_sel in selected_coords:
@@ -274,50 +345,107 @@ def _extract_bev_feature_peaks(runtime_store, cav_range, cfg):
                         break
                 if too_close:
                     continue
-            center_x = cav_range[0] + (col + 0.5) * x_res
-            center_y = cav_range[1] + (row + 0.5) * y_res
+            center_x = cav_range[0] + (col + 0.5) * (extent_x / max(grid_W, 1))
+            center_y = cav_range[1] + (row + 0.5) * (extent_y / max(grid_H, 1))
             center = [float(center_x), float(center_y), 0.0]
+            descriptor = None
+            if use_bev_descriptor:
+                vec = feat_map[:, row, col]
+                if channel_idx is not None:
+                    vec = vec.index_select(0, channel_idx)
+                vec = vec.detach().float().cpu()
+                if descriptor_norm:
+                    vec = vec / (vec.norm(p=2) + 1e-6)
+                descriptor = vec.numpy().astype(np.float32, copy=False).tolist()
             agent_features.append({
                 'type': 'feature',
                 'score': float(value),
                 'corners': _micro_box_from_center(center, box_dims, 0.0),
                 'center': center,
+                'descriptor': descriptor,
                 'level': level,
                 'grid': [int(row), int(col)],
             })
             selected_coords.append((row, col))
         per_agent_entries.append(agent_features)
-    per_agent_entries = _apply_neighbor_descriptor(per_agent_entries, neighbor_k)
+    if use_neighbor_descriptor:
+        per_agent_entries = _apply_neighbor_descriptor(per_agent_entries, neighbor_k)
     return _chunk_entries(per_agent_entries, record_len_list)
 
 
-def _annotate_detection_descriptors(runtime_store, cav_range, pred_corner3d_list, cfg):
+def _annotate_detection_descriptors(runtime_store, cav_range, pred_corner3d_list, cfg, pred_score_list=None):
     if not cfg.get('attach_detection'):
         return None
     bev_tensor = runtime_store.get('agent_bev')
     if bev_tensor is None:
         return None
+    descriptor_dim = int(cfg.get('descriptor_dim', 0))
+    descriptor_norm = bool(cfg.get('descriptor_norm', False))
+    descriptor_mode = str(cfg.get('descriptor_mode', 'neighbor')).lower()
+    use_bev_descriptor = 'bev' in descriptor_mode
+    use_neighbor_descriptor = 'neighbor' in descriptor_mode
     neighbor_k = max(1, int(cfg.get('neighbor_k', 6)))
+    extent_x = cav_range[3] - cav_range[0]
+    extent_y = cav_range[4] - cav_range[1]
+    _, _, feat_H, feat_W = bev_tensor.shape
+    x_res = extent_x / feat_W
+    y_res = extent_y / feat_H
     annotated = []
     for cav_idx, detections in enumerate(pred_corner3d_list):
         cav_entries = []
         if not isinstance(detections, list):
             annotated.append([])
             continue
-        for det in detections:
+        feat_map = bev_tensor[cav_idx]
+        if use_bev_descriptor:
+            channels = int(feat_map.shape[0])
+            if descriptor_dim <= 0 or descriptor_dim > channels:
+                channel_idx = None
+            else:
+                channel_idx = torch.linspace(0, channels - 1, steps=descriptor_dim, device=feat_map.device).long()
+        cav_scores = None
+        if isinstance(pred_score_list, list) and cav_idx < len(pred_score_list):
+            maybe_scores = pred_score_list[cav_idx]
+            if isinstance(maybe_scores, list):
+                cav_scores = maybe_scores
+        for det_idx, det in enumerate(detections):
             arr = np.asarray(det, dtype=np.float32)
             if arr.ndim >= 2:
                 center = arr.mean(axis=0)
             else:
                 center = arr
+            score = 1.0
+            if cav_scores is not None and det_idx < len(cav_scores):
+                score = float(cav_scores[det_idx])
+            descriptor = None
+            if use_bev_descriptor:
+                center_x = float(center[0])
+                center_y = float(center[1])
+                col = int((center_x - cav_range[0]) / max(x_res, 1e-6))
+                row = int((center_y - cav_range[1]) / max(y_res, 1e-6))
+                row = max(0, min(feat_H - 1, row))
+                col = max(0, min(feat_W - 1, col))
+                vec = feat_map[:, row, col]
+                if channel_idx is not None:
+                    vec = vec.index_select(0, channel_idx)
+                vec = vec.detach().float().cpu()
+                if descriptor_norm:
+                    vec = vec / (vec.norm(p=2) + 1e-6)
+                descriptor = vec.numpy().astype(np.float32, copy=False).tolist()
             cav_entries.append({
                 'type': 'detected',
-                'score': 1.0,
+                'score': score,
                 'corners': arr.tolist(),
                 'center': center.tolist(),
+                'descriptor': descriptor,
             })
         annotated.append(cav_entries)
-    return _apply_neighbor_descriptor(annotated, neighbor_k)
+    if use_neighbor_descriptor:
+        return _apply_neighbor_descriptor(annotated, neighbor_k)
+    for feats in annotated:
+        for feat in feats:
+            feat.pop('center', None)
+    return annotated
 
 
 def _ensure_box_align_config(hypes, stage1_checkpoint_path, output_dir):
@@ -351,7 +479,11 @@ def _load_state_dict_with_spconv_fix(checkpoint_path):
     state_dict = torch.load(checkpoint_path, map_location='cpu')
     for key, value in list(state_dict.items()):
         if isinstance(value, torch.Tensor) and value.ndim == 5:
-            state_dict[key] = value.permute(3, 0, 1, 2, 4).contiguous()
+            # spconv 1.x checkpoints store weights as [kz, C_out, ky, kx, C_in]
+            # while spconv 2.x stores [C_out, kz, ky, kx, C_in]. Only permute
+            # when the first dimension looks like the kernel depth (<=4).
+            if value.shape[0] <= 4:
+                state_dict[key] = value.permute(1, 0, 2, 3, 4).contiguous()
     return state_dict
 
 
@@ -364,6 +496,7 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
     bev_feature_enabled = bool(bev_feature_cfg.get('enabled', False))
     splits_list = _parse_splits(splits)
     hypes = yaml_utils.load_voxel_params(prepared_hypes)
+    default_cav_label = str(prepared_hypes.get('force_ego_cav', 'ego'))
 
     pos_std_list = [0]
     rot_std_list = [0]
@@ -475,6 +608,7 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
             stage1_boxes_save_path = os.path.join(stage1_boxes_save_dir, "stage1_boxes.json")
 
             loader = loader_map[split]
+            dataset_obj = getattr(loader, 'dataset', None)
             processed_split = 0
             for i, batch_data in enumerate(loader):
                 if max_samples is not None and processed_split >= max_samples:
@@ -483,7 +617,32 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
                     continue
 
                 batch_data = train_utils.to_device(batch_data, device)
-                print(i, batch_data['ego']['sample_idx'], batch_data['ego']['cav_id_list'])
+                raw_sample_idx = batch_data['ego'].get('sample_idx')
+                sample_idx = None
+                if raw_sample_idx is not None:
+                    if isinstance(raw_sample_idx, (list, tuple)):
+                        if raw_sample_idx:
+                            sample_idx = raw_sample_idx[0]
+                    elif torch.is_tensor(raw_sample_idx):
+                        sample_idx = raw_sample_idx.detach().cpu().item()
+                    else:
+                        sample_idx = raw_sample_idx
+                if sample_idx is None:
+                    sample_idx = i
+                sample_idx_str = str(sample_idx)
+                cav_id_list = batch_data['ego'].get('cav_id_list')
+                if not cav_id_list:
+                    cav_id_list = [default_cav_label]
+                veh_frame_id = None
+                infra_frame_id = None
+                if dataset_obj is not None and hasattr(dataset_obj, 'split_info'):
+                    if i < len(dataset_obj.split_info):
+                        veh_frame_id = str(dataset_obj.split_info[i])
+                        frame_info = getattr(dataset_obj, 'co_data', {}).get(veh_frame_id, {})
+                        infra_path = frame_info.get('infrastructure_image_path')
+                        if infra_path:
+                            infra_frame_id = infra_path.split('/')[-1].split('.')[0]
+                print(i, sample_idx_str, cav_id_list)
                 output_stage1 = stage1_model(batch_data['ego'])
                 if isinstance(output_stage1, dict) and 'unc_preds' not in output_stage1:
                     cls_preds_tensor = output_stage1.get('cls_preds')
@@ -493,8 +652,20 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
                         output_stage1['unc_preds'] = cls_preds_tensor.new_zeros(
                             (B, unc_channels, H, W), dtype=cls_preds_tensor.dtype, device=cls_preds_tensor.device
                         )
-                pred_corner3d_list, pred_box3d_list, uncertainty_list = \
-                    stage1_postprocessor.post_process_stage1(output_stage1, stage1_anchor_box)
+                stage1_outputs = stage1_postprocessor.post_process_stage1(
+                    output_stage1, stage1_anchor_box
+                )
+                if not stage1_outputs:
+                    continue
+                if isinstance(stage1_outputs, (list, tuple)) and len(stage1_outputs) == 3:
+                    pred_corner3d_list, pred_box3d_list, uncertainty_list = stage1_outputs
+                    score_list = None
+                elif isinstance(stage1_outputs, (list, tuple)) and len(stage1_outputs) >= 4:
+                    pred_corner3d_list, pred_box3d_list, uncertainty_list, score_list = stage1_outputs[:4]
+                else:
+                    raise ValueError(
+                        f"Unexpected stage1_postprocessor.post_process_stage1 output: {type(stage1_outputs)}"
+                    )
 
                 if pred_corner3d_list is None:
                     continue
@@ -515,11 +686,25 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
                         bev_feature_entries = bev_chunks[0]
 
                 if SAVE_BOXES:
-                    sample_idx = batch_data['ego']['sample_idx']
                     pred_corner3d_np_list = [x.cpu().numpy().tolist() for x in pred_corner3d_list]
+                    pred_box3d_np_list = [x.cpu().numpy().tolist() for x in pred_box3d_list]
                     uncertainty_np_list = [x.cpu().numpy().tolist() for x in uncertainty_list]
-                    lidar_pose_clean_np = batch_data['ego']['lidar_pose_clean'].cpu().numpy().tolist()
-                    stage1_boxes_dict[sample_idx] = OrderedDict()
+                    score_np_list = (
+                        [x.cpu().numpy().tolist() for x in score_list]
+                        if score_list is not None
+                        else None
+                    )
+                    lidar_pose_clean_tensor = batch_data['ego'].get('lidar_pose_clean')
+                    if lidar_pose_clean_tensor is None:
+                        lidar_pose_clean_tensor = batch_data['ego'].get('lidar_pose')
+                    if lidar_pose_clean_tensor is None:
+                        lidar_pose_clean_tensor = torch.zeros(
+                            (len(pred_corner3d_list), 6), dtype=torch.float32, device=device
+                        )
+                    else:
+                        lidar_pose_clean_tensor = torch.as_tensor(lidar_pose_clean_tensor, dtype=torch.float32)
+                    lidar_pose_clean_np = lidar_pose_clean_tensor.detach().cpu().numpy().tolist()
+                    stage1_boxes_dict[sample_idx_str] = OrderedDict()
 
                     detection_with_descriptor = None
                     if runtime_store and bev_feature_cfg.get('attach_detection'):
@@ -528,14 +713,20 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
                             cav_lidar_range,
                             pred_corner3d_np_list,
                             bev_feature_cfg,
+                            pred_score_list=score_np_list,
                         )
                     detections_to_store = detection_with_descriptor or pred_corner3d_np_list
 
-                    stage1_boxes_dict[sample_idx]['pred_corner3d_np_list'] = detections_to_store
-                    stage1_boxes_dict[sample_idx]['uncertainty_np_list'] = uncertainty_np_list
-                    stage1_boxes_dict[sample_idx]['lidar_pose_clean_np'] = lidar_pose_clean_np
-                    stage1_boxes_dict[sample_idx]['cav_id_list'] = batch_data['ego']['cav_id_list']
-                    stage1_boxes_dict[sample_idx]['bev_range'] = cav_lidar_range
+                    stage1_boxes_dict[sample_idx_str]['pred_corner3d_np_list'] = detections_to_store
+                    stage1_boxes_dict[sample_idx_str]['pred_box3d_np_list'] = pred_box3d_np_list
+                    if score_np_list is not None:
+                        stage1_boxes_dict[sample_idx_str]['pred_score_np_list'] = score_np_list
+                    stage1_boxes_dict[sample_idx_str]['uncertainty_np_list'] = uncertainty_np_list
+                    stage1_boxes_dict[sample_idx_str]['lidar_pose_clean_np'] = lidar_pose_clean_np
+                    stage1_boxes_dict[sample_idx_str]['cav_id_list'] = cav_id_list
+                    stage1_boxes_dict[sample_idx_str]['bev_range'] = cav_lidar_range
+                    stage1_boxes_dict[sample_idx_str]['veh_frame_id'] = veh_frame_id
+                    stage1_boxes_dict[sample_idx_str]['infra_frame_id'] = infra_frame_id
                     combined_features = None
                     if feature_entries:
                         combined_features = [list(boxes) for boxes, _ in feature_entries]
@@ -549,12 +740,26 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
                         for cav_idx, bev_boxes in enumerate(bev_feature_entries):
                             combined_features[cav_idx].extend(bev_boxes)
                     if combined_features:
-                        stage1_boxes_dict[sample_idx]['feature_corner3d_np_list'] = combined_features
-                    if runtime_store and runtime_store.get('occ_map_list'):
+                        stage1_boxes_dict[sample_idx_str]['feature_corner3d_np_list'] = combined_features
+                    dump_occ_inline = bool(bev_feature_cfg.get('dump_occ_map'))
+                    dump_occ_path = bool(bev_feature_cfg.get('dump_occ_map_path'))
+                    if runtime_store and runtime_store.get('occ_map_list') and (dump_occ_inline or dump_occ_path):
                         occ_tensor_list = runtime_store['occ_map_list']
                         if occ_tensor_list:
-                            occ_level0 = occ_tensor_list[0].detach().cpu().numpy().tolist()
-                            stage1_boxes_dict[sample_idx]['occ_map_level0'] = occ_level0
+                            occ_arr = occ_tensor_list[0].detach().cpu().numpy()
+                            if dump_occ_path:
+                                occ_dir = os.path.join(stage1_boxes_save_dir, 'occ_map_level0')
+                                if not os.path.exists(occ_dir):
+                                    os.makedirs(occ_dir)
+                                cav_tag = str(cav_id_list[0]) if cav_id_list else default_cav_label
+                                occ_path = os.path.join(occ_dir, f'{sample_idx_str}_{cav_tag}.npz')
+                                np.savez_compressed(
+                                    occ_path,
+                                    occ_map_level0=np.asarray(occ_arr, dtype=np.float32),
+                                )
+                                stage1_boxes_dict[sample_idx_str]['occ_map_level0_path'] = occ_path
+                            else:
+                                stage1_boxes_dict[sample_idx_str]['occ_map_level0'] = occ_arr.tolist()
                     processed_split += 1
 
             if SAVE_BOXES:
@@ -592,14 +797,29 @@ def merge_stage1_outputs(infra_stage1_path, vehicle_stage1_path, merged_output_d
         if infra_entry is None or veh_entry is None:
             continue
         record = OrderedDict()
-        record['cav_id_list'] = [
-            _first_list(infra_entry, 'cav_id_list'),
-            _first_list(veh_entry, 'cav_id_list'),
-        ]
+        infra_cav_id = _first_list(infra_entry, 'cav_id_list')
+        veh_cav_id = _first_list(veh_entry, 'cav_id_list')
+        # Per-agent exports may collapse cav_id_list to numeric IDs like [0].
+        # Use stable role labels for the merged dual-agent record.
+        if not isinstance(infra_cav_id, str):
+            infra_cav_id = 'infrastructure'
+        if not isinstance(veh_cav_id, str):
+            veh_cav_id = 'vehicle'
+        record['cav_id_list'] = [infra_cav_id, veh_cav_id]
         record['pred_corner3d_np_list'] = [
             _first_list(infra_entry, 'pred_corner3d_np_list'),
             _first_list(veh_entry, 'pred_corner3d_np_list'),
         ]
+        if 'pred_box3d_np_list' in infra_entry or 'pred_box3d_np_list' in veh_entry:
+            record['pred_box3d_np_list'] = [
+                _first_list(infra_entry, 'pred_box3d_np_list'),
+                _first_list(veh_entry, 'pred_box3d_np_list'),
+            ]
+        if 'pred_score_np_list' in infra_entry or 'pred_score_np_list' in veh_entry:
+            record['pred_score_np_list'] = [
+                _first_list(infra_entry, 'pred_score_np_list'),
+                _first_list(veh_entry, 'pred_score_np_list'),
+            ]
         record['uncertainty_np_list'] = [
             _first_list(infra_entry, 'uncertainty_np_list'),
             _first_list(veh_entry, 'uncertainty_np_list'),
@@ -608,6 +828,11 @@ def merge_stage1_outputs(infra_stage1_path, vehicle_stage1_path, merged_output_d
             record['occ_map_level0'] = [
                 infra_entry.get('occ_map_level0'),
                 veh_entry.get('occ_map_level0'),
+            ]
+        if 'occ_map_level0_path' in infra_entry or 'occ_map_level0_path' in veh_entry:
+            record['occ_map_level0_path'] = [
+                infra_entry.get('occ_map_level0_path'),
+                veh_entry.get('occ_map_level0_path'),
             ]
         if 'feature_corner3d_np_list' in infra_entry or 'feature_corner3d_np_list' in veh_entry:
             record['feature_corner3d_np_list'] = [
@@ -619,6 +844,10 @@ def merge_stage1_outputs(infra_stage1_path, vehicle_stage1_path, merged_output_d
                 _first_list(infra_entry, pose_key),
                 _first_list(veh_entry, pose_key),
             ]
+        if 'veh_frame_id' in infra_entry or 'veh_frame_id' in veh_entry:
+            record['veh_frame_id'] = infra_entry.get('veh_frame_id') or veh_entry.get('veh_frame_id')
+        if 'infra_frame_id' in infra_entry or 'infra_frame_id' in veh_entry:
+            record['infra_frame_id'] = infra_entry.get('infra_frame_id') or veh_entry.get('infra_frame_id')
         if 'bev_range' in infra_entry:
             record['bev_range'] = infra_entry['bev_range']
         elif 'bev_range' in veh_entry:
@@ -654,6 +883,8 @@ def run_per_agent_mode(opt, feature_cfg, bev_feature_cfg):
         if hypes_path is None or ckpt_path is None:
             raise ValueError(f"{name} export requires both hypes and checkpoint paths.")
         base_hypes = yaml_utils.load_yaml(hypes_path, Namespace(model_dir=""))
+        if opt.test_dir_override:
+            base_hypes['test_dir'] = opt.test_dir_override
         default_output_dir = output_dir or os.path.join(
             os.path.dirname(ckpt_path), f"stage1_{name}_export")
         prepared_hypes = _prepare_hypes(
@@ -689,12 +920,16 @@ def main():
         'topk': max(0, int(opt.bev_feature_topk)),
         'level': max(0, int(opt.bev_feature_level)),
         'score_min': float(opt.bev_feature_score_min),
+        'peak_score_source': str(opt.bev_peak_score_source).lower(),
         'descriptor_dim': max(0, int(opt.bev_descriptor_dim)),
+        'descriptor_mode': str(opt.bev_descriptor_mode).lower(),
         'descriptor_norm': bool(opt.bev_descriptor_norm),
         'box_dims': tuple(opt.bev_feature_box_dims),
         'min_separation': max(0, int(opt.bev_feature_min_separation)),
         'attach_detection': bool(opt.bev_descriptor_on_detections),
         'neighbor_k': max(1, int(opt.bev_descriptor_neighbors)),
+        'dump_occ_map': bool(opt.dump_occ_map),
+        'dump_occ_map_path': bool(opt.dump_occ_map_path),
     }
 
     if opt.per_agent:
@@ -702,6 +937,8 @@ def main():
         return
 
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+    if opt.test_dir_override:
+        hypes['test_dir'] = opt.test_dir_override
     checkpoint_path = opt.stage1_checkpoint
     if 'box_align_pre_calc' in hypes and not checkpoint_path:
         checkpoint_path = hypes['box_align_pre_calc'].get('stage1_model_path')

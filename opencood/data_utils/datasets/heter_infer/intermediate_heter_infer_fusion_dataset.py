@@ -148,33 +148,28 @@ def getIntermediateheterinferFusionDataset(cls):
             # box align to correct pose.
             # stage1_content contains all agent. Even out of comm range.
             if self.box_align and str(idx) in self.stage1_result.keys():
-                from opencood.models.sub_modules.box_align_v2 import box_alignment_relative_sample_np
-                stage1_content = self.stage1_result[str(idx)]
-                if stage1_content is not None:
-                    all_agent_id_list = stage1_content['cav_id_list'] # include those out of range
-                    all_agent_corners_list = stage1_content['pred_corner3d_np_list']
-                    all_agent_uncertainty_list = stage1_content['uncertainty_np_list']
+                from opencood.extrinsics.pose_correction import Stage1BoxAlignPoseCorrector
 
-                    cur_agent_id_list = cav_id_list
-                    cur_agent_pose = [base_data_dict[cav_id]['params']['lidar_pose'] for cav_id in cav_id_list]
-                    cur_agnet_pose = np.array(cur_agent_pose)
-                    cur_agent_in_all_agent = [all_agent_id_list.index(cur_agent) for cur_agent in cur_agent_id_list] # indexing current agent in `all_agent_id_list`
+                corrector = Stage1BoxAlignPoseCorrector(box_align_args=self.box_align_args)
+                corrected = corrector.apply(
+                    sample_idx=idx,
+                    cav_id_list=cav_id_list,
+                    base_data_dict=base_data_dict,
+                    stage1_result=self.stage1_result,
+                )
+                if corrected:
+                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
 
-                    pred_corners_list = [np.array(all_agent_corners_list[cur_in_all_ind], dtype=np.float64) 
-                                            for cur_in_all_ind in cur_agent_in_all_agent]
-                    uncertainty_list = [np.array(all_agent_uncertainty_list[cur_in_all_ind], dtype=np.float64) 
-                                            for cur_in_all_ind in cur_agent_in_all_agent]
 
-                    if sum([len(pred_corners) for pred_corners in pred_corners_list]) != 0:
-                        refined_pose = box_alignment_relative_sample_np(pred_corners_list,
-                                                                        cur_agnet_pose, 
-                                                                        uncertainty_list=uncertainty_list, 
-                                                                        **self.box_align_args)
-                        cur_agnet_pose[:,[0,1,4]] = refined_pose 
-
-                        for i, cav_id in enumerate(cav_id_list):
-                            lidar_pose_list[i] = cur_agnet_pose[i].tolist()
-                            base_data_dict[cav_id]['params']['lidar_pose'] = cur_agnet_pose[i].tolist()
+            if getattr(self, "v2xregpp_align", False) and str(idx) in getattr(self, "v2xregpp_stage1_result", {}).keys():
+                corrected = self.v2xregpp_corrector.apply(
+                    sample_idx=idx,
+                    cav_id_list=cav_id_list,
+                    base_data_dict=base_data_dict,
+                    stage1_result=self.v2xregpp_stage1_result,
+                )
+                if corrected:
+                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
 
 
 
@@ -342,5 +337,3 @@ def getIntermediateheterinferFusionDataset(cls):
 
 
     return Intermediate_heter_Infer_Fusion_Dataset
-
-

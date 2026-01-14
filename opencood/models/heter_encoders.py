@@ -14,8 +14,13 @@ from opencood.models.sub_modules.base_bev_backbone_resnet import ResNetBEVBackbo
 from opencood.models.sub_modules.base_bev_backbone import BaseBEVBackbone
 from opencood.models.sub_modules.downsample_conv import DownsampleConv
 from opencood.models.sub_modules.mean_vfe import MeanVFE
-from opencood.models.sub_modules.sparse_backbone_3d import VoxelBackBone8x
-from opencood.models.sub_modules.height_compression import HeightCompression
+
+try:
+    from opencood.models.sub_modules.sparse_backbone_3d import VoxelBackBone8x
+    from opencood.models.sub_modules.height_compression import HeightCompression
+except ModuleNotFoundError:
+    VoxelBackBone8x = None
+    HeightCompression = None
 
 
 
@@ -52,6 +57,10 @@ class PointPillar(nn.Module):
 class SECOND(nn.Module):
     def __init__(self, args):
         super(SECOND, self).__init__()
+        if VoxelBackBone8x is None or HeightCompression is None:
+            raise ModuleNotFoundError(
+                "SECOND encoder requires `spconv`; install spconv (v1.2.1 or v2.x) to use this encoder."
+            )
         lidar_range = np.array(args['lidar_range'])
         grid_size = np.round((lidar_range[3:6] - lidar_range[:3]) /
                                 np.array(args['voxel_size'])).astype(np.int64)
@@ -90,13 +99,13 @@ class LiftSplatShoot(nn.Module):
                                 self.grid_conf['zbound'],
                                 )  # 划分网格
 
-        self.dx = dx.clone().detach().requires_grad_(False).to(torch.device("cuda"))  # [0.4,0.4,20]
-        self.bx = bx.clone().detach().requires_grad_(False).to(torch.device("cuda"))  # [-49.8,-49.8,0]
-        self.nx = nx.clone().detach().requires_grad_(False).to(torch.device("cuda"))  # [250,250,1]
+        self.register_buffer("dx", dx.clone().detach())  # [0.4,0.4,20]
+        self.register_buffer("bx", bx.clone().detach())  # [-49.8,-49.8,0]
+        self.register_buffer("nx", nx.clone().detach())  # [250,250,1]
         self.depth_supervision = args['depth_supervision']
         self.downsample = args['img_downsample']  # 下采样倍数
         self.camC = args['img_features']  # 图像特征维度
-        self.frustum = self.create_frustum().clone().detach().requires_grad_(False).to(torch.device("cuda"))  # frustum: DxfHxfWx3(41x8x16x3)
+        self.register_buffer("frustum", self.create_frustum().clone().detach())  # frustum: DxfHxfWx3(41x8x16x3)
         self.use_quickcumsum = True
         self.D, _, _, _ = self.frustum.shape  # D: 41
         self.camera_encoder_type = args['camera_encoder']

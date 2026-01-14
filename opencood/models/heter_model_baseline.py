@@ -18,6 +18,7 @@ from opencood.models.sub_modules.base_bev_backbone import BaseBEVBackbone
 from opencood.models.sub_modules.downsample_conv import DownsampleConv
 from opencood.models.sub_modules.naive_compress import NaiveCompressor
 from opencood.models.fuse_modules.fusion_in_one import MaxFusion, AttFusion, DiscoFusion, V2VNetFusion, V2XViTFusion, CoBEVT, Where2commFusion, Who2comFusion
+from opencood.models.fuse_modules.pastat_fusion import PASTATFusion
 from opencood.utils.transformation_utils import normalize_pairwise_tfm
 from opencood.utils.model_utils import check_trainable_module, fix_bn, unfix_bn
 import importlib
@@ -94,21 +95,34 @@ class HeterModelBaseline(nn.Module):
 
 
         if args['fusion_method'] == "max":
+            self.fusion_method = "max"
             self.fusion_net = MaxFusion()
-        if args['fusion_method'] == "att":
+        elif args['fusion_method'] == "att":
+            self.fusion_method = "att"
             self.fusion_net = AttFusion(args['att']['feat_dim'])
-        if args['fusion_method'] == "disconet":
+        elif args['fusion_method'] == "disconet":
+            self.fusion_method = "disconet"
             self.fusion_net = DiscoFusion(args['disconet']['feat_dim'])
-        if args['fusion_method'] == "v2vnet":
+        elif args['fusion_method'] == "v2vnet":
+            self.fusion_method = "v2vnet"
             self.fusion_net = V2VNetFusion(args['v2vnet'])
-        if args['fusion_method'] == 'v2xvit':
+        elif args['fusion_method'] == 'v2xvit':
+            self.fusion_method = "v2xvit"
             self.fusion_net = V2XViTFusion(args['v2xvit'])
-        if args['fusion_method'] == 'cobevt':
+        elif args['fusion_method'] == 'cobevt':
+            self.fusion_method = "cobevt"
             self.fusion_net = CoBEVT(args['cobevt'])
-        if args['fusion_method'] == 'where2comm':
+        elif args['fusion_method'] == 'where2comm':
+            self.fusion_method = "where2comm"
             self.fusion_net = Where2commFusion(args['where2comm'])
-        if args['fusion_method'] == 'who2com':
+        elif args['fusion_method'] == 'who2com':
+            self.fusion_method = "who2com"
             self.fusion_net = Who2comFusion(args['who2com'])
+        elif args['fusion_method'] == 'pastat':
+            self.fusion_method = "pastat"
+            self.fusion_net = PASTATFusion(args['pastat'])
+        else:
+            raise ValueError(f"Unsupported fusion_method: {args['fusion_method']}")
 
 
         """
@@ -203,6 +217,14 @@ class HeterModelBaseline(nn.Module):
         
         if self.compress:
             heter_feature_2d = self.compressor(heter_feature_2d)
+
+        if self.fusion_method == "pastat":
+            pose_conf = data_dict.get("pose_confidence")
+            if pose_conf is None:
+                pose_conf = heter_feature_2d.new_ones((heter_feature_2d.shape[0],))
+            pose_conf = pose_conf.to(dtype=heter_feature_2d.dtype, device=heter_feature_2d.device).view(-1, 1, 1, 1)
+            conf_map = pose_conf.expand(-1, 1, heter_feature_2d.shape[2], heter_feature_2d.shape[3])
+            heter_feature_2d = torch.cat([heter_feature_2d, conf_map], dim=1)
 
         """
         Single supervision

@@ -27,8 +27,13 @@ def load_yaml(file, opt=None):
     param : dict
         A dictionary that contains defined parameters.
     """
-    if opt and opt.model_dir:
-        file = os.path.join(opt.model_dir, 'config.yaml')
+    # Prefer the saved run config when resuming from a checkpoint directory.
+    # If config.yaml does not exist (e.g., starting a new run with an explicit
+    # --model_dir), fall back to the provided yaml path.
+    if opt and getattr(opt, "model_dir", None):
+        candidate = os.path.join(opt.model_dir, 'config.yaml')
+        if os.path.exists(candidate):
+            file = candidate
 
     stream = open(file, 'r')
     loader = yaml.Loader
@@ -45,6 +50,9 @@ def load_yaml(file, opt=None):
     param = yaml.load(stream, Loader=loader)
     if "yaml_parser" in param:
         param = eval(param["yaml_parser"])(param)
+    env_force_ego = os.environ.get('FORCE_EGO_CAV')
+    if env_force_ego:
+        param['force_ego_cav'] = env_force_ego
 
     return param
 

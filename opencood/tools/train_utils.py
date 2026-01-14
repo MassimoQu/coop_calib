@@ -83,13 +83,25 @@ def load_saved_model(saved_path, model):
 
     file_list = glob.glob(os.path.join(saved_path, 'net_epoch_bestval_at*.pth'))
     if file_list:
-        assert len(file_list) == 1
-        print("resuming best validation model at epoch %d" % \
-                eval(file_list[0].split("/")[-1].rstrip(".pth").lstrip("net_epoch_bestval_at")))
-        loaded_state_dict = torch.load(file_list[0] , map_location='cpu')
+        # DDP training may leave multiple bestval checkpoints during the run.
+        # Prefer the one with the largest epoch number.
+        def _bestval_epoch(path: str) -> int:
+            try:
+                return int(path.split("/")[-1].rstrip(".pth").lstrip("net_epoch_bestval_at"))
+            except Exception:
+                return -1
+
+        file_list = sorted(file_list, key=_bestval_epoch)
+        best_path = file_list[-1]
+        best_epoch = _bestval_epoch(best_path)
+        if len(file_list) > 1:
+            print(f"found {len(file_list)} bestval checkpoints, using epoch {best_epoch}: {best_path}")
+        else:
+            print("resuming best validation model at epoch %d" % best_epoch)
+        loaded_state_dict = torch.load(best_path, map_location='cpu')
         check_missing_key(model.state_dict(), loaded_state_dict)
         model.load_state_dict(loaded_state_dict, strict=False)
-        return eval(file_list[0].split("/")[-1].rstrip(".pth").lstrip("net_epoch_bestval_at")), model
+        return best_epoch, model
 
     initial_epoch = findLastCheckpoint(saved_path)
     if initial_epoch > 0:
@@ -99,6 +111,49 @@ def load_saved_model(saved_path, model):
         check_missing_key(model.state_dict(), loaded_state_dict)
         model.load_state_dict(loaded_state_dict, strict=False)
 
+    return initial_epoch, model
+
+
+def load_latest_model(saved_path, model):
+    """
+    Load the latest epoch checkpoint (net_epoch{N}.pth) from a run directory.
+
+    Unlike load_saved_model(), this function ignores bestval checkpoints and is
+    intended for *resuming training* without rolling back to an earlier bestval.
+
+    Returns
+    -------
+    initial_epoch : int
+        The latest saved epoch number (as encoded in the filename).
+    model : opencood object
+        The model instance loaded pretrained params.
+    """
+    assert os.path.exists(saved_path), '{} not found'.format(saved_path)
+
+    file_list = glob.glob(os.path.join(saved_path, 'net_epoch*.pth'))
+    # Exclude bestval artifacts to avoid matching "net_epoch_bestval_at*.pth".
+    file_list = [p for p in file_list if os.path.basename(p).startswith("net_epoch") and "bestval" not in p]
+
+    if not file_list:
+        return 0, model
+
+    epochs_exist = []
+    for file_ in file_list:
+        result = re.findall(r".*net_epoch(\d+)\.pth$", file_)
+        if not result:
+            continue
+        epochs_exist.append(int(result[0]))
+    if not epochs_exist:
+        return 0, model
+
+    initial_epoch = max(epochs_exist)
+    print('resuming by loading latest epoch %d' % initial_epoch)
+    loaded_state_dict = torch.load(
+        os.path.join(saved_path, 'net_epoch%d.pth' % initial_epoch),
+        map_location='cpu',
+    )
+    check_missing_key(model.state_dict(), loaded_state_dict)
+    model.load_state_dict(loaded_state_dict, strict=False)
     return initial_epoch, model
 
 

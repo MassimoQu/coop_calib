@@ -98,22 +98,26 @@ class V2XFusionBlock(nn.Module):
                              heads=cav_att_config['heads'],
                              dim_head=cav_att_config['dim_head'],
                              dropout=cav_att_config['dropout'])
-            self.layers.append(nn.ModuleList([
-                PreNorm(cav_att_config['dim'], att),
-                PreNorm(cav_att_config['dim'],
-                        PyramidWindowAttention(pwindow_config['dim'],
-                                               heads=pwindow_config['heads'],
-                                               dim_heads=pwindow_config[
-                                                   'dim_head'],
-                                               drop_out=pwindow_config[
-                                                   'dropout'],
-                                               window_size=pwindow_config[
-                                                   'window_size'],
-                                               relative_pos_embedding=
-                                               pwindow_config[
-                                                   'relative_pos_embedding'],
-                                               fuse_method=pwindow_config[
-                                                   'fusion_method']))]))
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        PreNorm(cav_att_config["dim"], att),
+                        PreNorm(
+                            cav_att_config["dim"],
+                            PyramidWindowAttention(
+                                pwindow_config["dim"],
+                                heads=pwindow_config["heads"],
+                                dim_heads=pwindow_config["dim_head"],
+                                drop_out=pwindow_config["dropout"],
+                                window_size=pwindow_config["window_size"],
+                                relative_pos_embedding=pwindow_config["relative_pos_embedding"],
+                                fuse_method=pwindow_config["fusion_method"],
+                                pos_encoding=pwindow_config.get("pos_encoding", "rpe"),
+                            ),
+                        ),
+                    ]
+                )
+            )
 
     def forward(self, x, mask, prior_encoding):
         for cav_attn, pwindow_attn in self.layers:

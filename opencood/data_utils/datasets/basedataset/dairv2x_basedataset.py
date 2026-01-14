@@ -29,6 +29,10 @@ class DAIRV2XBaseDataset(Dataset):
         self.params = params
         self.visualize = visualize
         self.train = train
+        self.force_ego_cav = ""
+        force_cfg = params.get('force_ego_cav')
+        if force_cfg:
+            self.force_ego_cav = str(force_cfg).lower()
 
         self.pre_processor = build_preprocessor(params["preprocess"], train)
         self.post_processor = build_postprocessor(params["postprocess"], train)
@@ -71,9 +75,17 @@ class DAIRV2XBaseDataset(Dataset):
         self.split_info = read_json(split_dir)
         co_datainfo = read_json(os.path.join(self.root_dir, 'cooperative/data_info.json'))
         self.co_data = OrderedDict()
+        self.co_data_pair = {}
         for frame_info in co_datainfo:
             veh_frame_id = frame_info['vehicle_image_path'].split("/")[-1].replace(".jpg", "")
+            inf_frame_id = frame_info['infrastructure_image_path'].split("/")[-1].replace(".jpg", "")
             self.co_data[veh_frame_id] = frame_info
+            # Some DAIR releases contain duplicate vehicle frame IDs paired with different
+            # infrastructure frames. Keep an additional pair-level mapping so callers can
+            # disambiguate by providing both IDs (useful for evaluation subsets).
+            if veh_frame_id and inf_frame_id:
+                self.co_data_pair[f"{veh_frame_id}_{inf_frame_id}"] = frame_info
+                self.co_data_pair[f"{inf_frame_id}_{veh_frame_id}"] = frame_info
 
         if "noise_setting" not in self.params:
             self.params['noise_setting'] = OrderedDict()
@@ -98,8 +110,32 @@ class DAIRV2XBaseDataset(Dataset):
             The dictionary contains loaded yaml params and lidar data for
             each cav.
         """
-        veh_frame_id = self.split_info[idx]
-        frame_info = self.co_data[veh_frame_id]
+        split_entry = self.split_info[idx]
+        veh_frame_id = None
+        inf_frame_id = None
+        frame_info = None
+        if isinstance(split_entry, dict):
+            veh_frame_id = split_entry.get('veh_frame_id') or split_entry.get('vehicle_frame_id')
+            if veh_frame_id is None:
+                veh_frame_id = split_entry.get('veh') or split_entry.get('vehicle')
+            if veh_frame_id is None:
+                veh_frame_id = split_entry.get('vehicle_file_name')
+            inf_frame_id = split_entry.get('inf_frame_id') or split_entry.get('infra_frame_id')
+            if inf_frame_id is None:
+                inf_frame_id = split_entry.get('infra') or split_entry.get('infrastructure')
+            if inf_frame_id is None:
+                inf_frame_id = split_entry.get('infra_file_name')
+            if veh_frame_id is not None and inf_frame_id is not None:
+                veh_frame_id = str(veh_frame_id)
+                inf_frame_id = str(inf_frame_id)
+                frame_info = self.co_data_pair.get(f"{veh_frame_id}_{inf_frame_id}")
+        else:
+            veh_frame_id = str(split_entry)
+
+        if frame_info is None:
+            if veh_frame_id is None:
+                raise KeyError(f"Invalid split entry at idx={idx}: {split_entry}")
+            frame_info = self.co_data[veh_frame_id]
         system_error_offset = frame_info["system_error_offset"]
         data = OrderedDict()
 
@@ -159,6 +195,20 @@ class DAIRV2XBaseDataset(Dataset):
         data[1]['params']['vehicles_single_all'] = read_json(os.path.join(self.root_dir, \
                                 'infrastructure-side/label/virtuallidar/{}.json'.format(inf_frame_id)))
 
+        force_applied = False
+        if self.force_ego_cav:
+            force_target = None
+            if self.force_ego_cav.startswith('veh'):
+                force_target = 0
+            elif self.force_ego_cav.startswith('infra'):
+                force_target = 1
+            if force_target is not None:
+                force_applied = True
+                if force_target == 1:
+                    data[0], data[1] = data[1], data[0]
+                data[0]['ego'] = True
+                data[1]['ego'] = False
+
         if getattr(self, "heterogeneous", False):
             self.generate_object_center_lidar = \
                                 partial(self.generate_object_center_single_hetero, modality='lidar')
@@ -172,19 +222,21 @@ class DAIRV2XBaseDataset(Dataset):
             # data[0]['modality_name'] = 'm2'
             # data[1]['modality_name'] = 'm1'
 
-            if self.train: # randomly choose RSU or Veh to be Ego
-                p = np.random.rand()
-                if p > 0.5:
-                    data[0], data[1] = data[1], data[0]
-                    data[0]['ego'] = True
-                    data[1]['ego'] = False
+            if self.train:
+                if not force_applied:
+                    p = np.random.rand()
+                    if p > 0.5:
+                        data[0], data[1] = data[1], data[0]
+                        data[0]['ego'] = True
+                        data[1]['ego'] = False
             else:
-                # evaluate, the agent of ego modality should be ego
-                if self.adaptor.mapping_dict[data[0]['modality_name']] not in self.ego_modality and \
-                    self.adaptor.mapping_dict[data[1]['modality_name']] in self.ego_modality:
-                    data[0], data[1] = data[1], data[0]
-                    data[0]['ego'] = True
-                    data[1]['ego'] = False
+                if not force_applied:
+                    # evaluate, the agent of ego modality should be ego
+                    if self.adaptor.mapping_dict[data[0]['modality_name']] not in self.ego_modality and \
+                        self.adaptor.mapping_dict[data[1]['modality_name']] in self.ego_modality:
+                        data[0], data[1] = data[1], data[0]
+                        data[0]['ego'] = True
+                        data[1]['ego'] = False
 
             data[0]['modality_name'] = self.adaptor.reassign_cav_modality(data[0]['modality_name'], 0)
             data[1]['modality_name'] = self.adaptor.reassign_cav_modality(data[1]['modality_name'], 1)

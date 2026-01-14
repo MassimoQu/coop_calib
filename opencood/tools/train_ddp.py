@@ -2,6 +2,8 @@ import argparse
 import os
 import statistics
 import glob
+import warnings
+import yaml
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from tensorboardX import SummaryWriter
@@ -13,6 +15,9 @@ from opencood.tools import multi_gpu_utils
 from icecream import ic
 import tqdm
 
+warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"shapely\\..*")
+warnings.filterwarnings("ignore", message=r".*invalid value encountered in intersection.*", category=RuntimeWarning)
+
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --use_env opencood/tools/train_ddp.py --hypes_yaml ${CONFIG_FILE} [--model_dir  ${CHECKPOINT_FOLDER}
 
 def train_parser():
@@ -21,10 +26,44 @@ def train_parser():
                         help='data generation yaml file needed ')
     parser.add_argument('--model_dir', default='',
                         help='Continued training path')
+    parser.add_argument(
+        '--init_model_dir',
+        default='',
+        help='Initialize weights from a checkpoint directory, but start a new run (do not resume epoch/optimizer).',
+    )
     parser.add_argument('--fusion_method', '-f', default="intermediate",
                         help='passed to inference.')
     parser.add_argument("--half", action='store_true',
                         help="whether train with half precision")
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=4,
+        help='DataLoader workers per process.',
+    )
+    parser.add_argument(
+        '--max_epochs',
+        type=int,
+        default=0,
+        help='Optional cap on total epochs to run (debug only). 0 means no cap.',
+    )
+    parser.add_argument(
+        '--max_train_steps',
+        type=int,
+        default=0,
+        help='Optional cap on train steps per epoch (debug only). 0 means no cap.',
+    )
+    parser.add_argument(
+        '--max_val_steps',
+        type=int,
+        default=0,
+        help='Optional cap on validation steps per eval (debug only). 0 means no cap.',
+    )
+    parser.add_argument(
+        '--no_test',
+        action='store_true',
+        help='Skip running inference.py after training finishes.',
+    )
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
     opt = parser.parse_args()
@@ -51,25 +90,25 @@ def main():
 
         train_loader = DataLoader(opencood_train_dataset,
                                   batch_sampler=batch_sampler_train,
-                                  num_workers=8,
+                                  num_workers=int(opt.num_workers),
                                   collate_fn=opencood_train_dataset.collate_batch_train)
         val_loader = DataLoader(opencood_validate_dataset,
                                 sampler=sampler_val,
-                                num_workers=8,
+                                num_workers=int(opt.num_workers),
                                 collate_fn=opencood_train_dataset.collate_batch_train,
                                 drop_last=False)
     else:
         train_loader = DataLoader(opencood_train_dataset,
                                   batch_size=hypes['train_params'][
                                       'batch_size'],
-                                  num_workers=8,
+                                  num_workers=int(opt.num_workers),
                                   collate_fn=opencood_train_dataset.collate_batch_train,
                                   shuffle=True,
                                   pin_memory=True,
                                   drop_last=True)
         val_loader = DataLoader(opencood_validate_dataset,
                                 batch_size=hypes['train_params']['batch_size'],
-                                num_workers=8,
+                                num_workers=int(opt.num_workers),
                                 collate_fn=opencood_train_dataset.collate_batch_train,
                                 shuffle=True,
                                 pin_memory=True,
@@ -83,16 +122,40 @@ def main():
     lowest_val_loss = 1e5
     lowest_val_epoch = -1
 
-    # if we want to train from last checkpoint.
+    # Resume from last checkpoint OR initialize weights from another run.
     if opt.model_dir:
         saved_path = opt.model_dir
-        init_epoch, model = train_utils.load_saved_model(saved_path, model)
-        lowest_val_epoch = init_epoch
+        if opt.init_model_dir:
+            _loaded_epoch, model = train_utils.load_saved_model(opt.init_model_dir, model)
+            print(f"initialized model weights from {opt.init_model_dir} (checkpoint epoch {_loaded_epoch}).")
+            init_epoch = 0
+        else:
+            # Resume training from the latest epoch checkpoint (do not roll back to bestval).
+            init_epoch, model = train_utils.load_latest_model(saved_path, model)
+            lowest_val_epoch = init_epoch
     else:
+        # Optionally initialize model weights from another checkpoint, but start a new run.
+        if opt.init_model_dir:
+            _loaded_epoch, model = train_utils.load_saved_model(opt.init_model_dir, model)
+            print(f"initialized model weights from {opt.init_model_dir} (checkpoint epoch {_loaded_epoch}).")
         init_epoch = 0
         # if we train the model from scratch, we need to create a folder
         # to save the model,
         saved_path = train_utils.setup_train(hypes)
+
+    # If a user provided an explicit --model_dir for a *new* run, config.yaml may
+    # not exist yet (yaml_utils.load_yaml falls back to -y in that case). Save
+    # a resolved config + scripts snapshot for reproducibility.
+    if opt.rank == 0:
+        os.makedirs(saved_path, exist_ok=True)
+        config_path = os.path.join(saved_path, "config.yaml")
+        if not os.path.exists(config_path):
+            try:
+                with open(config_path, "w") as f:
+                    yaml.dump(hypes, f)
+                train_utils.backup_script(saved_path)
+            except Exception as e:
+                print(f"warning: failed to write config/scripts snapshot to {saved_path}: {e}")
 
     # we assume gpu is necessary
     if torch.cuda.is_available():
@@ -125,7 +188,9 @@ def main():
         scaler = torch.cuda.amp.GradScaler()
 
     print('Training start')
-    epoches = hypes['train_params']['epoches']
+    epoches = int(hypes['train_params']['epoches'])
+    if opt.max_epochs:
+        epoches = min(epoches, int(opt.max_epochs))
     supervise_single_flag = False if not hasattr(opencood_train_dataset, "supervise_single") else opencood_train_dataset.supervise_single
     # used to help schedule learning rate
 
@@ -143,6 +208,8 @@ def main():
         for i, batch_data in enumerate(train_loader):
             if batch_data is None or batch_data['ego']['object_bbx_mask'].sum()==0:
                 continue
+            if opt.max_train_steps and i >= opt.max_train_steps:
+                break
             model.zero_grad()
             optimizer.zero_grad()
             batch_data = train_utils.to_device(batch_data, device)
@@ -188,6 +255,8 @@ def main():
                 for i, batch_data in enumerate(val_loader):
                     if batch_data is None:
                         continue
+                    if opt.max_val_steps and i >= opt.max_val_steps:
+                        break
                     model.zero_grad()
                     optimizer.zero_grad()
                     model.eval()
@@ -225,7 +294,7 @@ def main():
     print('Training Finished, checkpoints saved to %s' % saved_path)
 
     if opt.rank == 0:
-        run_test = True
+        run_test = not bool(opt.no_test)
         
         # ddp training may leave multiple bestval
         bestval_model_list = glob.glob(os.path.join(saved_path, "net_epoch_bestval_at*"))

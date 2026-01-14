@@ -66,6 +66,10 @@ class HeterModelLate(nn.Module):
             setattr(self, f'reg_head_{modality_name}', nn.Conv2d(in_head, args['anchor_number'] * 7, kernel_size=1))
             setattr(self, f'dir_head_{modality_name}', nn.Conv2d(in_head, args['anchor_number'] *  args['dir_args']['num_bins'], kernel_size=1))
 
+        # runtime feature dumping support (for stage1 export / mid-fusion descriptors)
+        self.record_runtime_features = False
+        self._runtime_feature_store = {}
+
 
     def forward(self, data_dict):
         output_dict = {}
@@ -100,10 +104,23 @@ class HeterModelLate(nn.Module):
         feature = eval(f"self.layers_{modality_name}").decode_multiscale_feature(feature_list)
         
         feature = eval(f"self.shrink_conv_{modality_name}")(feature)
+        if self.record_runtime_features:
+            batch_size = int(feature.shape[0])
+            self._runtime_feature_store = {
+                'agent_bev': feature.detach().cpu(),
+                'record_len': torch.ones(batch_size, dtype=torch.int64).cpu(),
+                'agent_modality_list': [modality_name] * batch_size,
+            }
 
         cls_preds = eval(f"self.cls_head_{modality_name}")(feature)
         reg_preds = eval(f"self.reg_head_{modality_name}")(feature)
         dir_preds = eval(f"self.dir_head_{modality_name}")(feature)
+        if self.record_runtime_features:
+            try:
+                occ = torch.sigmoid(cls_preds).max(dim=1, keepdim=True)[0]
+                self._runtime_feature_store.update({'occ_map_list': [occ.detach().cpu()]})
+            except Exception:
+                pass
 
         output_dict.update({'cls_preds': cls_preds,
                             'reg_preds': reg_preds,

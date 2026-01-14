@@ -30,7 +30,7 @@ from opencood.utils.camera_utils import (
 )
 from opencood.utils.common_utils import merge_features_to_dict, compute_iou, convert_format
 from opencood.utils.transformation_utils import x1_to_x2, x_to_world, get_pairwise_transformation
-from opencood.utils.pose_utils import add_noise_data_dict
+from opencood.utils.pose_utils import add_noise_data_dict, attach_pose_confidence
 from opencood.data_utils.pre_processor import build_preprocessor
 from opencood.utils.pcd_utils import (
     mask_points_by_range,
@@ -99,9 +99,43 @@ def getIntermediateheterFusionDataset(cls):
             if "box_align" in params:
                 self.box_align = True
                 self.stage1_result_path = params['box_align']['train_result'] if train else params['box_align']['val_result']
+                from opencood.extrinsics.path_utils import resolve_repo_path
+
+                self.stage1_result_path = str(resolve_repo_path(self.stage1_result_path))
                 self.stage1_result = read_json(self.stage1_result_path)
                 self.box_align_args = params['box_align']['args']
-                
+
+            self.v2xregpp_align = False
+            if "v2xregpp_align" in params:
+                self.v2xregpp_align = True
+                cfg = params.get("v2xregpp_align") or {}
+                self.v2xregpp_stage1_result_path = cfg.get("train_result") if train else cfg.get("val_result")
+                if not self.v2xregpp_stage1_result_path:
+                    raise ValueError("v2xregpp_align requires train_result/val_result paths")
+                from opencood.extrinsics.path_utils import resolve_repo_path
+
+                self.v2xregpp_stage1_result_path = str(resolve_repo_path(self.v2xregpp_stage1_result_path))
+                self.v2xregpp_stage1_result = read_json(self.v2xregpp_stage1_result_path)
+                self.v2xregpp_align_args = cfg.get("args") or {}
+                from opencood.extrinsics.pose_correction import Stage1V2XRegPPPoseCorrector
+
+                config_path = self.v2xregpp_align_args.get("config_path")
+                if not config_path:
+                    raise ValueError("v2xregpp_align.args must include config_path (e.g., configs/pipeline_midfusion_detection_occ.yaml)")
+                self.v2xregpp_corrector = Stage1V2XRegPPPoseCorrector(**self.v2xregpp_align_args)
+
+            self.pgc_pose = False
+            if "pgc_pose" in params:
+                self.pgc_pose = True
+                cfg = params.get("pgc_pose") or {}
+                pgc_pose_path = cfg.get("train_result") if train else cfg.get("val_result")
+                if not pgc_pose_path:
+                    raise ValueError("pgc_pose requires train_result/val_result paths")
+                from opencood.extrinsics.path_utils import resolve_repo_path
+
+                pgc_pose_path = str(resolve_repo_path(pgc_pose_path))
+                self.pgc_pose_result = read_json(pgc_pose_path)
+
 
 
         def get_item_single_car(self, selected_cav_base, ego_cav_base):
@@ -366,39 +400,53 @@ def getIntermediateheterFusionDataset(cls):
             for cav_id in exclude_agent:
                 base_data_dict.pop(cav_id)
 
+            if self.pgc_pose and str(idx) in self.pgc_pose_result:
+                entry = self.pgc_pose_result[str(idx)] or {}
+                cav_ids = entry.get("cav_id_list") or entry.get("cav_ids") or []
+                poses = entry.get("lidar_pose_pred_np") or entry.get("lidar_pose_np") or []
+                confs = entry.get("pose_confidence_np") or entry.get("pose_confidence") or []
+                cav_ids_str = [str(c) for c in cav_ids]
+                for cav_id in cav_id_list:
+                    try:
+                        k = cav_ids_str.index(str(cav_id))
+                    except ValueError:
+                        continue
+                    if k < len(poses):
+                        base_data_dict[cav_id]["params"]["lidar_pose"] = poses[k]
+                    if k < len(confs):
+                        base_data_dict[cav_id]["params"]["pose_confidence"] = float(confs[k])
+                lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
+
             ########## Updated by Yifan Lu 2022.1.26 ############
             # box align to correct pose.
             # stage1_content contains all agent. Even out of comm range.
             if self.box_align and str(idx) in self.stage1_result.keys():
-                from opencood.models.sub_modules.box_align_v2 import box_alignment_relative_sample_np
-                stage1_content = self.stage1_result[str(idx)]
-                if stage1_content is not None:
-                    all_agent_id_list = stage1_content['cav_id_list'] # include those out of range
-                    all_agent_corners_list = stage1_content['pred_corner3d_np_list']
-                    all_agent_uncertainty_list = stage1_content['uncertainty_np_list']
+                from opencood.extrinsics.pose_correction import Stage1BoxAlignPoseCorrector
 
-                    cur_agent_id_list = cav_id_list
-                    cur_agent_pose = [base_data_dict[cav_id]['params']['lidar_pose'] for cav_id in cav_id_list]
-                    cur_agnet_pose = np.array(cur_agent_pose)
-                    cur_agent_in_all_agent = [all_agent_id_list.index(cur_agent) for cur_agent in cur_agent_id_list] # indexing current agent in `all_agent_id_list`
-
-                    pred_corners_list = [np.array(all_agent_corners_list[cur_in_all_ind], dtype=np.float64) 
-                                            for cur_in_all_ind in cur_agent_in_all_agent]
-                    uncertainty_list = [np.array(all_agent_uncertainty_list[cur_in_all_ind], dtype=np.float64) 
-                                            for cur_in_all_ind in cur_agent_in_all_agent]
-
-                    if sum([len(pred_corners) for pred_corners in pred_corners_list]) != 0:
-                        refined_pose = box_alignment_relative_sample_np(pred_corners_list,
-                                                                        cur_agnet_pose, 
-                                                                        uncertainty_list=uncertainty_list, 
-                                                                        **self.box_align_args)
-                        cur_agnet_pose[:,[0,1,4]] = refined_pose 
-
-                        for i, cav_id in enumerate(cav_id_list):
-                            lidar_pose_list[i] = cur_agnet_pose[i].tolist()
-                            base_data_dict[cav_id]['params']['lidar_pose'] = cur_agnet_pose[i].tolist()
+                corrector = Stage1BoxAlignPoseCorrector(box_align_args=self.box_align_args)
+                corrected = corrector.apply(
+                    sample_idx=idx,
+                    cav_id_list=cav_id_list,
+                    base_data_dict=base_data_dict,
+                    stage1_result=self.stage1_result,
+                )
+                if corrected:
+                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
 
 
+            if self.v2xregpp_align and str(idx) in self.v2xregpp_stage1_result.keys():
+                corrected = self.v2xregpp_corrector.apply(
+                    sample_idx=idx,
+                    cav_id_list=cav_id_list,
+                    base_data_dict=base_data_dict,
+                    stage1_result=self.v2xregpp_stage1_result,
+                )
+                if corrected:
+                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
+
+
+            attach_pose_confidence(base_data_dict)
+            pose_confidence_list = [base_data_dict[cav_id]["params"].get("pose_confidence", 1.0) for cav_id in cav_id_list]
 
             pairwise_t_matrix = \
                 get_pairwise_transformation(base_data_dict,
@@ -407,6 +455,7 @@ def getIntermediateheterFusionDataset(cls):
 
             lidar_poses = np.array(lidar_pose_list).reshape(-1, 6)  # [N_cav, 6]
             lidar_poses_clean = np.array(lidar_pose_clean_list).reshape(-1, 6)  # [N_cav, 6]
+            pose_confidence = np.array(pose_confidence_list, dtype=np.float32).reshape(-1)
             
             # merge preprocessed features from different cavs into the same dict
             cav_num = len(cav_id_list)
@@ -548,7 +597,8 @@ def getIntermediateheterFusionDataset(cls):
                 'cav_num': cav_num,
                 'pairwise_t_matrix': pairwise_t_matrix,
                 'lidar_poses_clean': lidar_poses_clean,
-                'lidar_poses': lidar_poses})
+                'lidar_poses': lidar_poses,
+                'pose_confidence': pose_confidence})
 
 
             if self.visualize:
@@ -587,6 +637,7 @@ def getIntermediateheterFusionDataset(cls):
             lidar_pose_list = []
             origin_lidar = []
             lidar_pose_clean_list = []
+            pose_confidence_list = []
 
             # pairwise transformation matrix
             pairwise_t_matrix_list = []
@@ -609,6 +660,7 @@ def getIntermediateheterFusionDataset(cls):
                 object_ids.append(ego_dict['object_ids'])
                 lidar_pose_list.append(ego_dict['lidar_poses']) # ego_dict['lidar_pose'] is np.ndarray [N,6]
                 lidar_pose_clean_list.append(ego_dict['lidar_poses_clean'])
+                pose_confidence_list.append(ego_dict.get('pose_confidence', np.ones((ego_dict['cav_num'],), dtype=np.float32)))
 
                 for modality_name in self.modality_name_list:
                     if ego_dict[f'input_{modality_name}'] is not None:
@@ -662,6 +714,7 @@ def getIntermediateheterFusionDataset(cls):
             record_len = torch.from_numpy(np.array(record_len, dtype=int))
             lidar_pose = torch.from_numpy(np.concatenate(lidar_pose_list, axis=0))
             lidar_pose_clean = torch.from_numpy(np.concatenate(lidar_pose_clean_list, axis=0))
+            pose_confidence = torch.from_numpy(np.concatenate(pose_confidence_list, axis=0)).to(torch.float32)
             label_torch_dict = \
                 self.post_processor.collate_batch(label_dict_list)
 
@@ -687,6 +740,7 @@ def getIntermediateheterFusionDataset(cls):
                                     'pairwise_t_matrix': pairwise_t_matrix,
                                     'lidar_pose_clean': lidar_pose_clean,
                                     'lidar_pose': lidar_pose,
+                                    'pose_confidence': pose_confidence,
                                     'anchor_box': self.anchor_box_torch})
 
 
@@ -784,5 +838,3 @@ def getIntermediateheterFusionDataset(cls):
 
 
     return IntermediateheterFusionDataset
-
-

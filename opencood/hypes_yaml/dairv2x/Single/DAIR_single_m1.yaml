@@ -6,8 +6,8 @@ test_dir: "dataset/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/val.json
 
 yaml_parser: "load_general_params"
 train_params:
-  batch_size: &batch_size 2
-  epoches: 30
+  batch_size: &batch_size 12
+  epoches: 20
   eval_freq: 2
   save_freq: 2
   max_cav: 2
@@ -176,4 +176,3 @@ lr_scheduler:
   core_method: multistep #step, multistep and Exponential support
   gamma: 0.1
   step_size: [15, 25]
-

@@ -520,23 +520,32 @@ class BasePostprocessor(object):
         output_dict = {}
         filter_range = self.params['anchor_args']['cav_lidar_range'] # if self.train else GT_RANGE_OPV2V
         inf_filter_range = [-1e5, -1e5, -1e5, 1e5, 1e5, 1e5]
-        visibility_map = np.asarray(cv2.cvtColor(cav_contents[0]["bev_visibility.png"], cv2.COLOR_BGR2GRAY))
+        visibility_bgr = cav_contents[0].get("bev_visibility.png")
+        visibility_map = None
+        if visibility_bgr is not None:
+            visibility_map = np.asarray(cv2.cvtColor(visibility_bgr, cv2.COLOR_BGR2GRAY))
         ego_lidar_pose = cav_contents[0]["params"]["lidar_pose_clean"]
 
         # 1-time filter: in ego coordinate, use visibility map to filter.
-        box_utils.project_world_visible_objects(tmp_object_dict,
-                                        output_dict,
-                                        ego_lidar_pose,
-                                        inf_filter_range,
-                                        self.params['order'],
-                                        visibility_map,
-                                        enlarge_z)
+        if visibility_map is None:
+            # Fallback for datasets without `bev_visibility.png`: treat all objects as visible.
+            updated_tmp_object_dict = tmp_object_dict
+        else:
+            box_utils.project_world_visible_objects(
+                tmp_object_dict,
+                output_dict,
+                ego_lidar_pose,
+                inf_filter_range,
+                self.params['order'],
+                visibility_map,
+                enlarge_z,
+            )
 
-        updated_tmp_object_dict = {}
-        for k, v in tmp_object_dict.items():
-            if k in output_dict:
-                updated_tmp_object_dict[k] = v # not visible
-        output_dict = {}
+            updated_tmp_object_dict = {}
+            for k, v in tmp_object_dict.items():
+                if k in output_dict:
+                    updated_tmp_object_dict[k] = v  # visible
+            output_dict = {}
 
         # 2-time filter: use reference_lidar_pose
         box_utils.project_world_objects(updated_tmp_object_dict,
