@@ -23,6 +23,116 @@ from opencood.data_utils.pre_processor import build_preprocessor
 from opencood.data_utils.post_processor import build_postprocessor
 
 class OPV2VBaseDataset(Dataset):
+    @staticmethod
+    def _infer_split_name_from_root(root_dir: str, train: bool) -> str:
+        """
+        Best-effort split name inference for scenario filtering.
+
+        OpenCOOD datasets typically use directory names {train, validate, test}.
+        """
+        try:
+            base = os.path.basename(os.path.normpath(str(root_dir))).lower()
+        except Exception:
+            base = ""
+        if base in {"train", "training"}:
+            return "train"
+        if base in {"val", "valid", "validate", "validation"}:
+            return "val"
+        if base in {"test", "testing"}:
+            return "test"
+        return "train" if train else "val"
+
+    @staticmethod
+    def _select_split_spec(spec, split_name: str):
+        if spec is None:
+            return None
+        if isinstance(spec, dict):
+            split_name = str(split_name).lower().strip()
+            # Common synonyms.
+            keys = [split_name]
+            if split_name == "val":
+                keys += ["validate", "validation"]
+            if split_name == "train":
+                keys += ["training"]
+            if split_name == "test":
+                keys += ["testing"]
+            keys += ["all", "any", "default"]
+            for k in keys:
+                if k in spec:
+                    return spec[k]
+            return None
+        return spec
+
+    @staticmethod
+    def _load_name_set(spec) -> set:
+        """
+        Load a set of scenario folder names from:
+        - list/tuple/set of names
+        - a repo-relative/absolute file path (.json/.txt/.yaml/.yml)
+        """
+        if spec is None:
+            return set()
+        if isinstance(spec, (list, tuple, set)):
+            return {str(x) for x in spec}
+        if not isinstance(spec, str):
+            # Unknown type; ignore for backward compatibility.
+            return set()
+
+        from opencood.extrinsics.path_utils import resolve_repo_path
+
+        path = str(resolve_repo_path(spec))
+        if path.endswith(".json"):
+            with open(path, "r") as f:
+                data = json.load(f)
+        elif path.endswith(".txt"):
+            with open(path, "r") as f:
+                data = [ln.strip() for ln in f.read().splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        elif path.endswith(".yaml") or path.endswith(".yml"):
+            # Do not use OpenCOOD's load_yaml() here: it assumes the root is a dict
+            # and may inject environment defaults. For scenario lists we want a raw load.
+            import yaml as _yaml
+
+            with open(path, "r") as f:
+                data = _yaml.safe_load(f)
+        else:
+            # Treat as a single scenario name.
+            data = [spec]
+
+        if isinstance(data, dict):
+            # Allow {"scenarios":[...]} or {"names":[...]}
+            data = data.get("scenarios") or data.get("names") or data.get("scenario_list") or []
+        if isinstance(data, (list, tuple, set)):
+            return {str(x) for x in data}
+        return set()
+
+    @classmethod
+    def _filter_scenario_folders(cls, scenario_folders, params: dict, split_name: str):
+        """
+        Apply non-invasive scenario filtering via yaml config.
+
+        Supported keys (all optional):
+        - scenario_list: list | path | {train/val/test: ...}
+        - scenario_blacklist: list | path | {train/val/test: ...}
+        """
+        include_spec = cls._select_split_spec(params.get("scenario_list"), split_name)
+        exclude_spec = cls._select_split_spec(params.get("scenario_blacklist"), split_name)
+
+        include = cls._load_name_set(include_spec)
+        exclude = cls._load_name_set(exclude_spec)
+
+        if not include and not exclude:
+            return scenario_folders
+
+        out = []
+        for p in scenario_folders:
+            name = os.path.basename(os.path.normpath(p))
+            if include and name not in include:
+                continue
+            if exclude and name in exclude:
+                continue
+            out.append(p)
+        return out
+
     def __init__(self, params, visualize, train=True):
         self.params = params
         self.visualize = visualize
@@ -76,6 +186,9 @@ class OPV2VBaseDataset(Dataset):
         scenario_folders = sorted([os.path.join(root_dir, x)
                                    for x in os.listdir(root_dir) if
                                    os.path.isdir(os.path.join(root_dir, x))])
+
+        split_name = self._infer_split_name_from_root(root_dir, bool(self.train))
+        scenario_folders = self._filter_scenario_folders(scenario_folders, params, split_name)
         
         self.scenario_folders = scenario_folders
         self.reinitialize()
