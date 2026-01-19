@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from opencood.extrinsics.path_utils import resolve_repo_path
-from opencood.pose.freealign_paper import EdgeGATLite
+from opencood.pose.freealign_paper import EdgeGAT, EdgeGATLite
 from opencood.utils.box_utils import project_box3d
 from opencood.utils.transformation_utils import x1_to_x2
 
@@ -315,6 +315,9 @@ def main() -> None:
 
     ap.add_argument("--hidden_dim", type=int, default=64)
     ap.add_argument("--out_dim", type=int, default=16)
+    ap.add_argument("--gnn_type", type=str, default="lite", choices=["lite", "egat"])
+    ap.add_argument("--gnn_heads", type=int, default=4)
+    ap.add_argument("--gnn_dropout", type=float, default=0.0)
 
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -359,7 +362,16 @@ def main() -> None:
         )
 
     device = torch.device(str(args.device))
-    net = EdgeGATLite(hidden_dim=int(args.hidden_dim), out_dim=int(args.out_dim))
+    gnn_type = str(args.gnn_type or "lite").lower().strip()
+    if gnn_type == "egat":
+        net = EdgeGAT(
+            hidden_dim=int(args.hidden_dim),
+            out_dim=int(args.out_dim),
+            num_heads=int(args.gnn_heads),
+            dropout=float(args.gnn_dropout),
+        )
+    else:
+        net = EdgeGATLite(hidden_dim=int(args.hidden_dim), out_dim=int(args.out_dim))
     net.to(device)
     opt = torch.optim.Adam(net.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 

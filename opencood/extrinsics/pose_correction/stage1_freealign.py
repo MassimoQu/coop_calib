@@ -8,7 +8,54 @@ import numpy as np
 from opencood.extrinsics.bbox_utils import corners_to_bbox3d_list
 from opencood.pose.freealign_paper import FreeAlignPaperConfig, FreeAlignPaperEstimator
 from opencood.pose.freealign_repo import FreeAlignRepoConfig, FreeAlignRepoEstimator
-from opencood.utils.transformation_utils import tfm_to_pose, x_to_world
+from opencood.utils.box_utils import project_box3d
+from opencood.utils.transformation_utils import pose_to_tfm, tfm_to_pose, x1_to_x2, x_to_world
+
+
+def _wrap_angle_deg(angle: float) -> float:
+    return float(((angle + 180.0) % 360.0) - 180.0)
+
+
+def _delta_angle_deg(a: float, b: float) -> float:
+    return float(_wrap_angle_deg(a - b))
+
+
+def _smooth_se2(
+    prev: Tuple[float, float, float],
+    cur: Tuple[float, float, float],
+    *,
+    alpha: float,
+) -> Tuple[float, float, float]:
+    a = float(alpha)
+    if a <= 0.0:
+        return prev
+    if a >= 1.0:
+        return cur
+    x = (1.0 - a) * float(prev[0]) + a * float(cur[0])
+    y = (1.0 - a) * float(prev[1]) + a * float(cur[1])
+    dyaw = _delta_angle_deg(float(cur[2]), float(prev[2]))
+    yaw = _wrap_angle_deg(float(prev[2]) + a * dyaw)
+    return float(x), float(y), float(yaw)
+
+
+def _limit_step_se2(
+    prev: Tuple[float, float, float],
+    cur: Tuple[float, float, float],
+    *,
+    max_step_xy_m: float,
+    max_step_yaw_deg: float,
+) -> bool:
+    max_xy = float(max_step_xy_m or 0.0)
+    if max_xy > 0.0:
+        dx = float(cur[0] - prev[0])
+        dy = float(cur[1] - prev[1])
+        if float(np.hypot(dx, dy)) > max_xy + 1e-6:
+            return False
+    max_yaw = float(max_step_yaw_deg or 0.0)
+    if max_yaw > 0.0:
+        if abs(_delta_angle_deg(float(cur[2]), float(prev[2]))) > max_yaw + 1e-6:
+            return False
+    return True
 
 
 def _normalize_agent_role(raw: Any) -> Optional[str]:
@@ -103,6 +150,56 @@ def _extract_boxes(
     return corners_to_bbox3d_list(corners_np, bbox_type=bbox_type, scores=scores)
 
 
+def _frame_id_to_int(frame_id: Any) -> Optional[int]:
+    if frame_id is None:
+        return None
+    try:
+        return int(str(frame_id))
+    except Exception:
+        return None
+
+
+def _extract_pose_from_stage1(
+    stage1_content: Mapping[str, Any],
+    *,
+    agent_idx: int,
+    use_clean: bool,
+) -> Optional[Sequence[float]]:
+    key = "lidar_pose_clean_np" if use_clean else "lidar_pose_np"
+    poses = stage1_content.get(key)
+    if not isinstance(poses, list) or agent_idx < 0 or agent_idx >= len(poses):
+        return None
+    pose = poses[agent_idx]
+    if not isinstance(pose, (list, tuple)) or len(pose) < 6:
+        return None
+    return pose
+
+
+def _transform_boxes_to_current(
+    boxes: Sequence[object],
+    *,
+    T_cur_from_past: np.ndarray,
+) -> List[object]:
+    if not boxes:
+        return []
+    corners = []
+    scores = []
+    bbox_type = None
+    for bbox in boxes:
+        try:
+            corners.append(np.asarray(bbox.get_bbox3d_8_3(), dtype=np.float32))
+            scores.append(float(getattr(bbox, "confidence", 1.0)))
+            if bbox_type is None:
+                bbox_type = str(bbox.get_bbox_type())
+        except Exception:
+            continue
+    if not corners:
+        return []
+    corners_np = np.stack(corners, axis=0)
+    projected = project_box3d(corners_np, T_cur_from_past)
+    return corners_to_bbox3d_list(projected, bbox_type=bbox_type or "detected", scores=scores)
+
+
 @dataclass
 class Stage1FreeAlignPoseCorrector:
     """
@@ -115,9 +212,167 @@ class Stage1FreeAlignPoseCorrector:
     bbox_type: str = "detected"
 
     _estimator: FreeAlignPaperEstimator = field(init=False, repr=False)
+    _state: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    # Cache per (sample_idx, cav_id) to avoid repeating matching in noise sweeps.
+    _rel_T_est_cache: Dict[Tuple[int, str], Optional[np.ndarray]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self._estimator = FreeAlignPaperEstimator(self.cfg)
+
+    def _reset_if_new_epoch(self, sample_idx: int) -> None:
+        last = self._state.get("last_sample_idx")
+        if last is None or int(sample_idx) < int(last):
+            self._state.clear()
+        self._state["last_sample_idx"] = int(sample_idx)
+
+    def _get_prev_delta(self, key: str) -> Optional[Tuple[float, float, float]]:
+        store = self._state.get("delta_se2", {})
+        if not isinstance(store, dict):
+            return None
+        prev = store.get(str(key))
+        if prev is None:
+            return None
+        try:
+            x, y, yaw = float(prev[0]), float(prev[1]), float(prev[2])
+        except Exception:
+            return None
+        return x, y, yaw
+
+    def _set_prev_delta(self, key: str, delta: Tuple[float, float, float]) -> None:
+        store = self._state.setdefault("delta_se2", {})
+        if not isinstance(store, dict):
+            return
+        store[str(key)] = (float(delta[0]), float(delta[1]), float(delta[2]))
+
+    def _ensure_time_index(self, stage1_result: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+        cache = self._state.get("time_index")
+        cache_id = self._state.get("time_index_id")
+        if cache is not None and cache_id == id(stage1_result):
+            return cache
+
+        time_index: Dict[str, List[Tuple[int, str]]] = {}
+        for key, entry in stage1_result.items():
+            if not isinstance(entry, Mapping):
+                continue
+            veh_frame = _frame_id_to_int(entry.get("veh_frame_id"))
+            infra_frame = _frame_id_to_int(entry.get("infra_frame_id"))
+            if veh_frame is not None:
+                time_index.setdefault("vehicle", []).append((int(veh_frame), str(key)))
+            if infra_frame is not None:
+                time_index.setdefault("infrastructure", []).append((int(infra_frame), str(key)))
+
+        resolved: Dict[str, Dict[str, Any]] = {}
+        for role, pairs in time_index.items():
+            pairs.sort(key=lambda x: x[0])
+            frames = [p[0] for p in pairs]
+            keys = [p[1] for p in pairs]
+            pos_map = {int(frame): int(idx) for idx, frame in enumerate(frames)}
+            resolved[str(role)] = {"frames": frames, "keys": keys, "pos_map": pos_map}
+
+        self._state["time_index"] = resolved
+        self._state["time_index_id"] = id(stage1_result)
+        return resolved
+
+    def _estimate_temporal_rel_T(
+        self,
+        *,
+        sample_idx: int,
+        ego_id: Any,
+        cav_id: Any,
+        ego_idx: int,
+        cav_idx: int,
+        all_agent_ids: Sequence[Any],
+        base_data_dict: Mapping[Any, Any],
+        stage1_content: Mapping[str, Any],
+        stage1_result: Mapping[str, Any],
+    ) -> Tuple[Optional[np.ndarray], float, int, Dict[str, Any]]:
+        time_buffer = int(getattr(self.cfg, "time_buffer", 0) or 0)
+        if time_buffer <= 0:
+            return None, 0.0, 0, {"reason": "time_buffer_disabled"}
+        time_stride = max(1, int(getattr(self.cfg, "time_stride", 1) or 1))
+        use_clean = bool(getattr(self.cfg, "time_use_clean_pose", True))
+
+        time_index = self._ensure_time_index(stage1_result)
+        role = _normalize_agent_role(ego_id) or _infer_dair_role_from_base(base_data_dict, ego_id)
+        if role is None or role not in time_index:
+            return None, 0.0, 0, {"reason": "missing_role"}
+        frame_field = "veh_frame_id" if role == "vehicle" else "infra_frame_id"
+        cur_frame = _frame_id_to_int(stage1_content.get(frame_field))
+        if cur_frame is None:
+            return None, 0.0, 0, {"reason": "missing_frame"}
+
+        pos_map = time_index[role]["pos_map"]
+        keys = time_index[role]["keys"]
+        pos = pos_map.get(int(cur_frame))
+        if pos is None:
+            return None, 0.0, 0, {"reason": "frame_not_indexed"}
+
+        cav_boxes = _extract_boxes(stage1_content, agent_idx=cav_idx, bbox_type=self.bbox_type)
+        if not cav_boxes:
+            return None, 0.0, 0, {"reason": "empty_cav_boxes"}
+
+        cur_pose = _extract_pose_from_stage1(stage1_content, agent_idx=ego_idx, use_clean=use_clean)
+
+        best_T = None
+        best_eps = float("inf")
+        best_matches = -1
+        best_meta: Dict[str, Any] = {}
+        best_step = None
+
+        for step in range(0, time_buffer + 1):
+            pos_k = int(pos - step * time_stride)
+            if pos_k < 0:
+                break
+            key_k = keys[pos_k]
+            entry_k = stage1_result.get(str(key_k))
+            if not isinstance(entry_k, Mapping):
+                continue
+            indices_k = _extract_agent_indices(
+                entry_k.get("cav_id_list") or [],
+                ego_id=ego_id,
+                cav_id=cav_id,
+                base_data_dict=base_data_dict,
+            )
+            if indices_k is None:
+                continue
+            ego_idx_k, _ = indices_k
+            ego_boxes = _extract_boxes(entry_k, agent_idx=ego_idx_k, bbox_type=self.bbox_type)
+            if not ego_boxes:
+                continue
+            if cur_pose is not None:
+                past_pose = _extract_pose_from_stage1(entry_k, agent_idx=ego_idx_k, use_clean=use_clean)
+                if past_pose is not None:
+                    T_cur_from_past = x1_to_x2(past_pose, cur_pose)
+                    ego_boxes = _transform_boxes_to_current(ego_boxes, T_cur_from_past=T_cur_from_past)
+                    if not ego_boxes:
+                        continue
+
+            rel_T_est, stability, matches, meta = self._estimator.estimate(
+                cav_boxes=cav_boxes, ego_boxes=ego_boxes, T_init=None
+            )
+            if rel_T_est is None:
+                continue
+            eps = float(meta.get("eps", float("inf")))
+            if eps < best_eps - 1e-9 or (abs(eps - best_eps) <= 1e-9 and matches > best_matches):
+                best_T = np.asarray(rel_T_est, dtype=np.float64)
+                best_eps = float(eps)
+                best_matches = int(matches)
+                best_meta = dict(meta or {})
+                best_step = int(step)
+
+        if best_T is None:
+            return None, 0.0, 0, {"reason": "no_temporal_match"}
+        best_meta.update(
+            {
+                "time_offset_steps": int(best_step if best_step is not None else 0),
+                "time_buffer": int(time_buffer),
+                "time_stride": int(time_stride),
+                "time_role": str(role),
+            }
+        )
+        return best_T, float(best_matches), int(best_matches), best_meta
 
     def apply(
         self,
@@ -140,6 +395,11 @@ class Stage1FreeAlignPoseCorrector:
         if stage1_content is None:
             return False
 
+        mode = str(getattr(self.cfg, "mode", "initfree") or "initfree").lower().strip()
+        stable = mode == "stable"
+        if stable:
+            self._reset_if_new_epoch(int(sample_idx))
+
         all_agent_ids = stage1_content.get("cav_id_list") or []
         if not isinstance(all_agent_ids, list) or len(all_agent_ids) < 2:
             return False
@@ -152,6 +412,7 @@ class Stage1FreeAlignPoseCorrector:
 
         ego_pose = base_data_dict[ego_id]["params"]["lidar_pose"]
         Tw_ego = x_to_world(ego_pose)
+        ego_T_world = np.asarray(Tw_ego, dtype=np.float64)
 
         updated = False
         for cav_id in cav_id_list[1:]:
@@ -162,16 +423,82 @@ class Stage1FreeAlignPoseCorrector:
                 continue
             ego_idx, cav_idx = indices
 
-            ego_boxes = _extract_boxes(stage1_content, agent_idx=ego_idx, bbox_type=self.bbox_type)
-            cav_boxes = _extract_boxes(stage1_content, agent_idx=cav_idx, bbox_type=self.bbox_type)
-            T_ego_cav, stability, matches, meta = self._estimator.estimate(
-                cav_boxes=cav_boxes, ego_boxes=ego_boxes, T_init=None
-            )
-            if T_ego_cav is None:
-                continue
+            cache_key = (int(sample_idx), str(cav_id))
+            missing = object()
+            cached = self._rel_T_est_cache.get(cache_key, missing)
+            if cached is not missing:
+                rel_T_est = None if cached is None else np.asarray(cached, dtype=np.float64)
+                stability = 0.0
+                matches = 0
+                meta = {}
+            else:
+                time_buffer = int(getattr(self.cfg, "time_buffer", 0) or 0)
+                if time_buffer > 0:
+                    rel_T_est, stability, matches, meta = self._estimate_temporal_rel_T(
+                        sample_idx=sample_idx,
+                        ego_id=ego_id,
+                        cav_id=cav_id,
+                        ego_idx=ego_idx,
+                        cav_idx=cav_idx,
+                        all_agent_ids=all_agent_ids,
+                        base_data_dict=base_data_dict,
+                        stage1_content=stage1_content,
+                        stage1_result=stage1_result,
+                    )
+                else:
+                    ego_boxes = _extract_boxes(stage1_content, agent_idx=ego_idx, bbox_type=self.bbox_type)
+                    cav_boxes = _extract_boxes(stage1_content, agent_idx=cav_idx, bbox_type=self.bbox_type)
+                    T_ego_cav, stability, matches, meta = self._estimator.estimate(
+                        cav_boxes=cav_boxes, ego_boxes=ego_boxes, T_init=None
+                    )
+                    rel_T_est = np.asarray(T_ego_cav, dtype=np.float64) if T_ego_cav is not None else None
+                self._rel_T_est_cache[cache_key] = None if rel_T_est is None else np.asarray(rel_T_est, dtype=np.float64)
 
-            Tw_cav_new = Tw_ego @ np.asarray(T_ego_cav, dtype=np.float64)
-            pose_new = tfm_to_pose(Tw_cav_new)
+            cav_pose_current = base_data_dict[cav_id]["params"]["lidar_pose"]
+            cav_T_world_current = x_to_world(cav_pose_current)
+            rel_current_T = np.linalg.inv(ego_T_world) @ np.asarray(cav_T_world_current, dtype=np.float64)
+
+            rel_T_corrected: Optional[np.ndarray]
+            if not stable:
+                if rel_T_est is None:
+                    continue
+                rel_T_corrected = rel_T_est
+            else:
+                rel_key = str(cav_id)
+                prev_delta = self._get_prev_delta(rel_key)
+                if rel_T_est is not None:
+                    try:
+                        delta_T = np.asarray(rel_T_est, dtype=np.float64) @ np.linalg.inv(np.asarray(rel_current_T, dtype=np.float64))
+                        delta_pose6 = tfm_to_pose(delta_T)
+                        delta_xyyaw = (
+                            float(delta_pose6[0]),
+                            float(delta_pose6[1]),
+                            _wrap_angle_deg(float(delta_pose6[4])),
+                        )
+                    except Exception:
+                        delta_xyyaw = None
+
+                    if delta_xyyaw is not None:
+                        if prev_delta is not None:
+                            if not _limit_step_se2(
+                                prev_delta,
+                                delta_xyyaw,
+                                max_step_xy_m=float(getattr(self.cfg, "max_step_xy_m", 0.0) or 0.0),
+                                max_step_yaw_deg=float(getattr(self.cfg, "max_step_yaw_deg", 0.0) or 0.0),
+                            ):
+                                delta_xyyaw = prev_delta
+                            else:
+                                delta_xyyaw = _smooth_se2(prev_delta, delta_xyyaw, alpha=float(getattr(self.cfg, "ema_alpha", 0.5) or 0.0))
+                        self._set_prev_delta(rel_key, delta_xyyaw)
+                        prev_delta = delta_xyyaw
+
+                if prev_delta is None:
+                    continue
+                delta_T_se2 = pose_to_tfm(np.asarray([[prev_delta[0], prev_delta[1], prev_delta[2]]], dtype=np.float64))[0]
+                rel_T_corrected = np.asarray(delta_T_se2, dtype=np.float64) @ np.asarray(rel_current_T, dtype=np.float64)
+
+            cav_T_world_new = ego_T_world @ np.asarray(rel_T_corrected, dtype=np.float64)
+            pose_new = tfm_to_pose(cav_T_world_new)
             pose_old = list(base_data_dict[cav_id]["params"]["lidar_pose"])
             if len(pose_old) < 6:
                 continue
@@ -197,9 +524,39 @@ class Stage1FreeAlignRepoPoseCorrector:
     bbox_type: str = "detected"
 
     _estimator: FreeAlignRepoEstimator = field(init=False, repr=False)
+    _state: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    # Cache per (sample_idx, cav_id) to avoid repeating matching in noise sweeps.
+    _rel_T_est_cache: Dict[Tuple[int, str], Optional[np.ndarray]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self._estimator = FreeAlignRepoEstimator(self.cfg)
+
+    def _reset_if_new_epoch(self, sample_idx: int) -> None:
+        last = self._state.get("last_sample_idx")
+        if last is None or int(sample_idx) < int(last):
+            self._state.clear()
+        self._state["last_sample_idx"] = int(sample_idx)
+
+    def _get_prev_delta(self, key: str) -> Optional[Tuple[float, float, float]]:
+        store = self._state.get("delta_se2", {})
+        if not isinstance(store, dict):
+            return None
+        prev = store.get(str(key))
+        if prev is None:
+            return None
+        try:
+            x, y, yaw = float(prev[0]), float(prev[1]), float(prev[2])
+        except Exception:
+            return None
+        return x, y, yaw
+
+    def _set_prev_delta(self, key: str, delta: Tuple[float, float, float]) -> None:
+        store = self._state.setdefault("delta_se2", {})
+        if not isinstance(store, dict):
+            return
+        store[str(key)] = (float(delta[0]), float(delta[1]), float(delta[2]))
 
     def apply(
         self,
@@ -222,6 +579,11 @@ class Stage1FreeAlignRepoPoseCorrector:
         if stage1_content is None:
             return False
 
+        mode = str(getattr(self.cfg, "mode", "initfree") or "initfree").lower().strip()
+        stable = mode == "stable"
+        if stable:
+            self._reset_if_new_epoch(int(sample_idx))
+
         all_agent_ids = stage1_content.get("cav_id_list") or []
         if not isinstance(all_agent_ids, list) or len(all_agent_ids) < 2:
             return False
@@ -234,6 +596,7 @@ class Stage1FreeAlignRepoPoseCorrector:
 
         ego_pose = base_data_dict[ego_id]["params"]["lidar_pose"]
         Tw_ego = x_to_world(ego_pose)
+        ego_T_world = np.asarray(Tw_ego, dtype=np.float64)
 
         updated = False
         for cav_id in cav_id_list[1:]:
@@ -244,14 +607,66 @@ class Stage1FreeAlignRepoPoseCorrector:
                 continue
             ego_idx, cav_idx = indices
 
-            ego_boxes = _extract_boxes(stage1_content, agent_idx=ego_idx, bbox_type=self.bbox_type)
-            cav_boxes = _extract_boxes(stage1_content, agent_idx=cav_idx, bbox_type=self.bbox_type)
-            T_ego_cav, stability, matches, meta = self._estimator.estimate(cav_boxes=cav_boxes, ego_boxes=ego_boxes)
-            if T_ego_cav is None:
-                continue
+            cache_key = (int(sample_idx), str(cav_id))
+            missing = object()
+            cached = self._rel_T_est_cache.get(cache_key, missing)
+            if cached is not missing:
+                rel_T_est = None if cached is None else np.asarray(cached, dtype=np.float64)
+                stability = 0.0
+                matches = 0
+                meta = {}
+            else:
+                ego_boxes = _extract_boxes(stage1_content, agent_idx=ego_idx, bbox_type=self.bbox_type)
+                cav_boxes = _extract_boxes(stage1_content, agent_idx=cav_idx, bbox_type=self.bbox_type)
+                T_ego_cav, stability, matches, meta = self._estimator.estimate(cav_boxes=cav_boxes, ego_boxes=ego_boxes)
+                rel_T_est = np.asarray(T_ego_cav, dtype=np.float64) if T_ego_cav is not None else None
+                self._rel_T_est_cache[cache_key] = None if rel_T_est is None else np.asarray(rel_T_est, dtype=np.float64)
 
-            Tw_cav_new = Tw_ego @ np.asarray(T_ego_cav, dtype=np.float64)
-            pose_new = tfm_to_pose(Tw_cav_new)
+            cav_pose_current = base_data_dict[cav_id]["params"]["lidar_pose"]
+            cav_T_world_current = x_to_world(cav_pose_current)
+            rel_current_T = np.linalg.inv(ego_T_world) @ np.asarray(cav_T_world_current, dtype=np.float64)
+
+            rel_T_corrected: Optional[np.ndarray]
+            if not stable:
+                if rel_T_est is None:
+                    continue
+                rel_T_corrected = rel_T_est
+            else:
+                rel_key = str(cav_id)
+                prev_delta = self._get_prev_delta(rel_key)
+                if rel_T_est is not None:
+                    try:
+                        delta_T = np.asarray(rel_T_est, dtype=np.float64) @ np.linalg.inv(np.asarray(rel_current_T, dtype=np.float64))
+                        delta_pose6 = tfm_to_pose(delta_T)
+                        delta_xyyaw = (
+                            float(delta_pose6[0]),
+                            float(delta_pose6[1]),
+                            _wrap_angle_deg(float(delta_pose6[4])),
+                        )
+                    except Exception:
+                        delta_xyyaw = None
+
+                    if delta_xyyaw is not None:
+                        if prev_delta is not None:
+                            if not _limit_step_se2(
+                                prev_delta,
+                                delta_xyyaw,
+                                max_step_xy_m=float(getattr(self.cfg, "max_step_xy_m", 0.0) or 0.0),
+                                max_step_yaw_deg=float(getattr(self.cfg, "max_step_yaw_deg", 0.0) or 0.0),
+                            ):
+                                delta_xyyaw = prev_delta
+                            else:
+                                delta_xyyaw = _smooth_se2(prev_delta, delta_xyyaw, alpha=float(getattr(self.cfg, "ema_alpha", 0.5) or 0.0))
+                        self._set_prev_delta(rel_key, delta_xyyaw)
+                        prev_delta = delta_xyyaw
+
+                if prev_delta is None:
+                    continue
+                delta_T_se2 = pose_to_tfm(np.asarray([[prev_delta[0], prev_delta[1], prev_delta[2]]], dtype=np.float64))[0]
+                rel_T_corrected = np.asarray(delta_T_se2, dtype=np.float64) @ np.asarray(rel_current_T, dtype=np.float64)
+
+            cav_T_world_new = ego_T_world @ np.asarray(rel_T_corrected, dtype=np.float64)
+            pose_new = tfm_to_pose(cav_T_world_new)
             pose_old = list(base_data_dict[cav_id]["params"]["lidar_pose"])
             if len(pose_old) < 6:
                 continue

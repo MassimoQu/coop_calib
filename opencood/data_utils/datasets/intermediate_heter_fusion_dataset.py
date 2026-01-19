@@ -12,6 +12,7 @@ instead of using the cooperative label.
 
 import random
 import math
+import time
 from collections import OrderedDict
 import numpy as np
 import torch
@@ -94,6 +95,7 @@ def getIntermediateheterFusionDataset(cls):
                 
 
             self.kd_flag = params.get('kd_flag', False)
+            self.pose_timing = bool(params.get("pose_timing", False))
 
             self.box_align = False
             if "box_align" in params:
@@ -124,6 +126,37 @@ def getIntermediateheterFusionDataset(cls):
                     raise ValueError("v2xregpp_align.args must include config_path (e.g., configs/pipeline_midfusion_detection_occ.yaml)")
                 self.v2xregpp_corrector = Stage1V2XRegPPPoseCorrector(**self.v2xregpp_align_args)
 
+            self.freealign_align = False
+            if "freealign_align" in params:
+                self.freealign_align = True
+                cfg = params.get("freealign_align") or {}
+                self.freealign_stage1_result_path = cfg.get("train_result") if train else cfg.get("val_result")
+                if not self.freealign_stage1_result_path:
+                    raise ValueError("freealign_align requires train_result/val_result paths")
+                from opencood.extrinsics.path_utils import resolve_repo_path
+
+                self.freealign_stage1_result_path = str(resolve_repo_path(self.freealign_stage1_result_path))
+                self.freealign_stage1_result = read_json(self.freealign_stage1_result_path)
+                self.freealign_align_args = cfg.get("args") or {}
+                backend = str(self.freealign_align_args.get("backend") or self.freealign_align_args.get("mode") or "paper").lower().strip()
+
+                from dataclasses import fields
+                from opencood.extrinsics.pose_correction import Stage1FreeAlignPoseCorrector, Stage1FreeAlignRepoPoseCorrector
+                from opencood.pose.freealign_paper import FreeAlignPaperConfig
+                from opencood.pose.freealign_repo import FreeAlignRepoConfig
+
+                if backend in {"repo", "released", "match_v7", "match_v7_with_detection"}:
+                    allowed = {f.name for f in fields(FreeAlignRepoConfig)}
+                    cfg_kwargs = {k: v for k, v in (self.freealign_align_args or {}).items() if k in allowed}
+                    self.freealign_corrector = Stage1FreeAlignRepoPoseCorrector(cfg=FreeAlignRepoConfig(**cfg_kwargs))
+                else:
+                    allowed = {f.name for f in fields(FreeAlignPaperConfig)}
+                    cfg_kwargs = {k: v for k, v in (self.freealign_align_args or {}).items() if k in allowed}
+                    ckpt_path = cfg_kwargs.get("ckpt_path")
+                    if ckpt_path:
+                        cfg_kwargs["ckpt_path"] = str(resolve_repo_path(str(ckpt_path)))
+                    self.freealign_corrector = Stage1FreeAlignPoseCorrector(cfg=FreeAlignPaperConfig(**cfg_kwargs))
+
             self.pgc_pose = False
             if "pgc_pose" in params:
                 self.pgc_pose = True
@@ -135,6 +168,13 @@ def getIntermediateheterFusionDataset(cls):
 
                 pgc_pose_path = str(resolve_repo_path(pgc_pose_path))
                 self.pgc_pose_result = read_json(pgc_pose_path)
+                self.pgc_pose_args = cfg.get("args") or {}
+                from dataclasses import fields
+                from opencood.extrinsics.pose_correction import Stage1PGCPoseCorrector
+
+                allowed = {f.name for f in fields(Stage1PGCPoseCorrector) if getattr(f, "init", False)}
+                cfg_kwargs = {k: v for k, v in (self.pgc_pose_args or {}).items() if k in allowed}
+                self.pgc_corrector = Stage1PGCPoseCorrector(**cfg_kwargs)
 
 
 
@@ -275,7 +315,12 @@ def getIntermediateheterFusionDataset(cls):
 
                     img_src[0] = normalize_img(img_src[0])
                     if self.load_depth_file:
-                        img_src[1] = img_to_tensor(img_src[1]) * 255
+                        depth_img = img_src[1]
+                        depth_t = img_to_tensor(depth_img)
+                        # Depth from .npy is loaded as PIL "F" (meters) and should not be rescaled.
+                        if getattr(depth_img, "mode", None) != "F":
+                            depth_t = depth_t * 255
+                        img_src[1] = depth_t
 
                     imgs.append(torch.cat(img_src, dim=0))
                     intrins.append(intrin)
@@ -345,6 +390,54 @@ def getIntermediateheterFusionDataset(cls):
             assert ego_id != -1
             assert len(ego_lidar_pose) > 0
 
+            pose_timing = {} if self.pose_timing else None
+
+            # Optional: apply pose correction before comm-range filtering so that
+            # agent inclusion/exclusion does not depend on injected pose noise.
+            v2xregpp_applied_pre_filter = False
+            freealign_applied_pre_filter = False
+            pgc_applied_pre_filter = False
+            if self.v2xregpp_align and str(idx) in self.v2xregpp_stage1_result.keys():
+                t0 = time.perf_counter() if self.pose_timing else None
+                applied = self.v2xregpp_corrector.apply(
+                    sample_idx=idx,
+                    cav_id_list=list(base_data_dict.keys()),
+                    base_data_dict=base_data_dict,
+                    stage1_result=self.v2xregpp_stage1_result,
+                )
+                if self.pose_timing and t0 is not None and pose_timing is not None:
+                    pose_timing["v2xregpp_pre_sec"] = float(time.perf_counter() - t0)
+                    pose_timing["v2xregpp_pre_applied"] = bool(applied)
+                # Only skip the second-pass correction if we actually updated any pose.
+                v2xregpp_applied_pre_filter = bool(applied)
+
+            if self.freealign_align and str(idx) in self.freealign_stage1_result.keys():
+                t0 = time.perf_counter() if self.pose_timing else None
+                applied = self.freealign_corrector.apply(
+                    sample_idx=idx,
+                    cav_id_list=list(base_data_dict.keys()),
+                    base_data_dict=base_data_dict,
+                    stage1_result=self.freealign_stage1_result,
+                )
+                if self.pose_timing and t0 is not None and pose_timing is not None:
+                    pose_timing["freealign_pre_sec"] = float(time.perf_counter() - t0)
+                    pose_timing["freealign_pre_applied"] = bool(applied)
+                # Only skip the second-pass correction if we actually updated any pose.
+                freealign_applied_pre_filter = bool(applied)
+
+            if self.pgc_pose and str(idx) in self.pgc_pose_result:
+                t0 = time.perf_counter() if self.pose_timing else None
+                applied = self.pgc_corrector.apply(
+                    sample_idx=idx,
+                    cav_id_list=list(base_data_dict.keys()),
+                    base_data_dict=base_data_dict,
+                    pose_result=self.pgc_pose_result,
+                )
+                if self.pose_timing and t0 is not None and pose_timing is not None:
+                    pose_timing["pgc_pre_sec"] = float(time.perf_counter() - t0)
+                    pose_timing["pgc_pre_applied"] = bool(applied)
+                pgc_applied_pre_filter = bool(applied)
+
             
             input_list_m1 = [] # can contain lidar or camera
             input_list_m2 = []
@@ -401,21 +494,20 @@ def getIntermediateheterFusionDataset(cls):
                 base_data_dict.pop(cav_id)
 
             if self.pgc_pose and str(idx) in self.pgc_pose_result:
-                entry = self.pgc_pose_result[str(idx)] or {}
-                cav_ids = entry.get("cav_id_list") or entry.get("cav_ids") or []
-                poses = entry.get("lidar_pose_pred_np") or entry.get("lidar_pose_np") or []
-                confs = entry.get("pose_confidence_np") or entry.get("pose_confidence") or []
-                cav_ids_str = [str(c) for c in cav_ids]
-                for cav_id in cav_id_list:
-                    try:
-                        k = cav_ids_str.index(str(cav_id))
-                    except ValueError:
-                        continue
-                    if k < len(poses):
-                        base_data_dict[cav_id]["params"]["lidar_pose"] = poses[k]
-                    if k < len(confs):
-                        base_data_dict[cav_id]["params"]["pose_confidence"] = float(confs[k])
-                lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
+                # Skip the second application if already applied before filtering.
+                if not pgc_applied_pre_filter:
+                    t0 = time.perf_counter() if self.pose_timing else None
+                    applied = self.pgc_corrector.apply(
+                        sample_idx=idx,
+                        cav_id_list=cav_id_list,
+                        base_data_dict=base_data_dict,
+                        pose_result=self.pgc_pose_result,
+                    )
+                    if self.pose_timing and t0 is not None and pose_timing is not None:
+                        pose_timing["pgc_post_sec"] = float(time.perf_counter() - t0)
+                        pose_timing["pgc_post_applied"] = bool(applied)
+                    if applied:
+                        lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
 
             ########## Updated by Yifan Lu 2022.1.26 ############
             # box align to correct pose.
@@ -435,14 +527,35 @@ def getIntermediateheterFusionDataset(cls):
 
 
             if self.v2xregpp_align and str(idx) in self.v2xregpp_stage1_result.keys():
-                corrected = self.v2xregpp_corrector.apply(
-                    sample_idx=idx,
-                    cav_id_list=cav_id_list,
-                    base_data_dict=base_data_dict,
-                    stage1_result=self.v2xregpp_stage1_result,
-                )
-                if corrected:
-                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
+                # Skip the second application if we've already applied a correction before filtering.
+                if not v2xregpp_applied_pre_filter:
+                    t0 = time.perf_counter() if self.pose_timing else None
+                    corrected = self.v2xregpp_corrector.apply(
+                        sample_idx=idx,
+                        cav_id_list=cav_id_list,
+                        base_data_dict=base_data_dict,
+                        stage1_result=self.v2xregpp_stage1_result,
+                    )
+                    if self.pose_timing and t0 is not None and pose_timing is not None:
+                        pose_timing["v2xregpp_post_sec"] = float(time.perf_counter() - t0)
+                        pose_timing["v2xregpp_post_applied"] = bool(corrected)
+                    if corrected:
+                        lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
+
+            if self.freealign_align and str(idx) in self.freealign_stage1_result.keys():
+                t0 = time.perf_counter() if self.pose_timing else None
+                if not freealign_applied_pre_filter:
+                    corrected = self.freealign_corrector.apply(
+                        sample_idx=idx,
+                        cav_id_list=cav_id_list,
+                        base_data_dict=base_data_dict,
+                        stage1_result=self.freealign_stage1_result,
+                    )
+                    if self.pose_timing and t0 is not None and pose_timing is not None:
+                        pose_timing["freealign_sec"] = float(time.perf_counter() - t0)
+                        pose_timing["freealign_applied"] = bool(corrected)
+                    if corrected:
+                        lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
 
 
             attach_pose_confidence(base_data_dict)
@@ -606,7 +719,8 @@ def getIntermediateheterFusionDataset(cls):
                     np.vstack(
                         projected_lidar_stack)})
 
-
+            if self.pose_timing and pose_timing is not None:
+                processed_data_dict['ego'].update({"pose_timing": pose_timing})
             processed_data_dict['ego'].update({'sample_idx': idx,
                                                 'cav_id_list': cav_id_list})
 
@@ -638,6 +752,7 @@ def getIntermediateheterFusionDataset(cls):
             origin_lidar = []
             lidar_pose_clean_list = []
             pose_confidence_list = []
+            pose_timing_list = []
 
             # pairwise transformation matrix
             pairwise_t_matrix_list = []
@@ -661,6 +776,8 @@ def getIntermediateheterFusionDataset(cls):
                 lidar_pose_list.append(ego_dict['lidar_poses']) # ego_dict['lidar_pose'] is np.ndarray [N,6]
                 lidar_pose_clean_list.append(ego_dict['lidar_poses_clean'])
                 pose_confidence_list.append(ego_dict.get('pose_confidence', np.ones((ego_dict['cav_num'],), dtype=np.float32)))
+                if 'pose_timing' in ego_dict:
+                    pose_timing_list.append(ego_dict['pose_timing'])
 
                 for modality_name in self.modality_name_list:
                     if ego_dict[f'input_{modality_name}'] is not None:
@@ -742,6 +859,8 @@ def getIntermediateheterFusionDataset(cls):
                                     'lidar_pose': lidar_pose,
                                     'pose_confidence': pose_confidence,
                                     'anchor_box': self.anchor_box_torch})
+            if pose_timing_list:
+                output_dict['ego'].update({'pose_timing': pose_timing_list if len(pose_timing_list) > 1 else pose_timing_list[0]})
 
 
             if self.visualize:

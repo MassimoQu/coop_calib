@@ -6,7 +6,7 @@ from einops import rearrange
 
 class HGTCavAttention(nn.Module):
     def __init__(self, dim, heads, num_types=2,
-                 num_relations=4, dim_head=64, dropout=0.1):
+                 num_relations=4, dim_head=64, dropout=0.1, pose_pe=None):
         super().__init__()
         inner_dim = heads * dim_head
 
@@ -34,6 +34,42 @@ class HGTCavAttention(nn.Module):
 
         torch.nn.init.xavier_uniform(self.relation_att)
         torch.nn.init.xavier_uniform(self.relation_msg)
+
+        # Optional pose-aware bias for agent-wise attention.
+        pose_cfg = pose_pe or {}
+        self.use_pose_pe = bool(pose_cfg.get("enabled", False))
+        if self.use_pose_pe:
+            hidden_dim = int(pose_cfg.get("hidden_dim", max(32, dim_head * 2)))
+            self.pose_trans_scale = float(pose_cfg.get("translation_scale", 50.0))
+            in_dim = 9  # (dx,dy,dz) + sin/cos for (roll,yaw,pitch)
+            self.pose_mlp = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, heads),
+            )
+            self.pose_dropout = nn.Dropout(float(pose_cfg.get("dropout", 0.0)))
+
+    def _pose_bias(self, pairwise_t_matrix: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pairwise_t_matrix: (B, L, L, 4, 4) where [i,j] maps i->j.
+        Returns:
+            bias: (B, heads, L, L)
+        """
+        from opencood.utils.transformation_utils import tfm_to_pose_torch
+
+        B, L = pairwise_t_matrix.shape[:2]
+        tfm = pairwise_t_matrix.reshape(-1, 4, 4).to(dtype=torch.float32)
+        pose_deg = tfm_to_pose_torch(tfm, dof=6)  # x,y,z,roll,yaw,pitch (degree)
+
+        trans = pose_deg[:, 0:3] / max(self.pose_trans_scale, 1e-6)
+        angles = torch.deg2rad(pose_deg[:, 3:6])
+        feats = torch.cat([trans, torch.sin(angles), torch.cos(angles)], dim=-1)  # (N, 9)
+
+        bias = self.pose_mlp(feats)  # (N, heads)
+        bias = self.pose_dropout(bias)
+        bias = bias.view(B, L, L, self.heads).permute(0, 3, 1, 2).contiguous()
+        return bias
 
     def to_qkv(self, x, types):
         # x: (B,H,W,L,C)
@@ -107,7 +143,7 @@ class HGTCavAttention(nn.Module):
         out = torch.cat(out_batch, dim=0)
         return out
 
-    def forward(self, x, mask, prior_encoding):
+    def forward(self, x, mask, prior_encoding, pairwise_t_matrix=None):
         # x: (B, L, H, W, C) -> (B, H, W, L, C)
         # mask: (B, H, W, L, 1)
         # prior_encoding: (B,L,H,W,3)
@@ -131,6 +167,9 @@ class HGTCavAttention(nn.Module):
         att_map = torch.einsum(
             'b m h w i p, b m i j p q, bm h w j q -> b m h w i j',
             [q, w_att, k]) * self.scale
+        if self.use_pose_pe and (pairwise_t_matrix is not None):
+            pose_bias = self._pose_bias(pairwise_t_matrix).to(dtype=att_map.dtype, device=att_map.device)
+            att_map = att_map + pose_bias[:, :, None, None, :, :]
         # add mask
         att_map = att_map.masked_fill(mask == 0, -float('inf'))
         # softmax

@@ -2,6 +2,7 @@
 # Author: Yifan Lu <yifan_lu@sjtu.edu.cn>
 # License: TDG-Attribution-NonCommercial-NoDistrib
 
+import torch
 import torch.nn as nn
 from icecream import ic
 from opencood.models.sub_modules.pillar_vfe import PillarVFE
@@ -134,7 +135,13 @@ class PointPillarBaseline(nn.Module):
             conf_map = pose_conf.expand(-1, 1, spatial_features_2d.shape[2], spatial_features_2d.shape[3])
             spatial_features_2d = torch.cat([spatial_features_2d, conf_map], dim=1)
 
-        fused_feature = self.fusion_net(spatial_features_2d, record_len, affine_matrix)
+        if self.fusion_method == 'v2xvit':
+            fused_feature = self.fusion_net(spatial_features_2d,
+                                            record_len,
+                                            affine_matrix,
+                                            data_dict.get('pairwise_t_matrix'))
+        else:
+            fused_feature = self.fusion_net(spatial_features_2d, record_len, affine_matrix)
 
         psm = self.cls_head(fused_feature)
         rm = self.reg_head(fused_feature)

@@ -363,7 +363,14 @@ def main() -> None:
                 if pgid is not None:
                     _terminate_pgid(pgid, timeout_sec=30)
                 if opt.run_sweep_on_finish:
-                    sweep_cmd = f"bash opencood/tools/run_noise_sweep.sh {opt.model_dir}"
+                    # By default, run the sweep on the same GPUs reserved for training.
+                    gpu_list = [g.strip() for g in str(opt.cuda_visible_devices or "").split(",") if g.strip()]
+                    gpu_all = gpu_list[0] if gpu_list else "0"
+                    gpu_nonego = gpu_list[1] if len(gpu_list) > 1 else gpu_all
+                    sweep_cmd = (
+                        f"GPU_ALL={gpu_all} GPU_NONEGO={gpu_nonego} "
+                        f"bash opencood/tools/run_noise_sweep.sh {opt.model_dir}"
+                    )
                     print(f"[watchdog] running sweep: {sweep_cmd}", flush=True)
                     subprocess.call(sweep_cmd, shell=True, cwd=heal_root)
                 return

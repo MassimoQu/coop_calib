@@ -279,6 +279,7 @@ class BevEncodeSSFusion(nn.Module):
     def __init__(self, fusion_args):  # inC: 64  outC: not 1 for object detection
         super(BevEncodeSSFusion, self).__init__()
         args = fusion_args['args']
+        self.fusion_method = fusion_args['core_method']
         inC = args['in_channels']
         self.discrete_ratio = args['voxel_size'][0]  
         self.downsample_rate = 1
@@ -321,7 +322,8 @@ class BevEncodeSSFusion(nn.Module):
         B, L = pairwise_t_matrix.shape[:2]
 
         # (B,L,L,2,3)
-        pairwise_t_matrix = normalize_pairwise_tfm(pairwise_t_matrix, H, W, self.discrete_ratio, self.downsample_rate)
+        pairwise_t_matrix_4x4 = pairwise_t_matrix
+        affine_matrix = normalize_pairwise_tfm(pairwise_t_matrix_4x4, H, W, self.discrete_ratio, self.downsample_rate)
 
         x = self.conv1(x)  # x: 4 x 64 x 120 x 120
         x = self.bn1(x)
@@ -333,7 +335,10 @@ class BevEncodeSSFusion(nn.Module):
         x_single = self.down_layer(self.up_layer1(self.up_layer2(x3, x2), x1)) # 4 x 128 x 120 x 120
 
         x = self.up_layer1(self.up_layer2(x3, x2), x1) # 4 x 256 x 120 x 120
-        x_fuse = self.fuse_module(x, record_len, pairwise_t_matrix)
+        if self.fusion_method == "v2xvit":
+            x_fuse = self.fuse_module(x, record_len, affine_matrix, pairwise_t_matrix_4x4)
+        else:
+            x_fuse = self.fuse_module(x, record_len, affine_matrix)
         x_fuse = self.down_layer(x_fuse)
 
 
@@ -402,4 +407,3 @@ class BevEncodeMSFusion(nn.Module):
         x_fuse = self.down_layer(self.up_layer1(self.up_layer2(x3_fuse, x2_fuse), x1_fuse)) # 4 x 64 x 120 x 120
 
         return x_single, x_fuse
-

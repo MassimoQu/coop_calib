@@ -34,6 +34,28 @@ def _delta_angle_deg(a: float, b: float) -> float:
     return float(_wrap_angle_deg(a - b))
 
 
+def _topk_by_confidence(boxes: Sequence[object], k: int) -> List[object]:
+    if k is None or int(k) <= 0 or len(boxes) <= int(k):
+        return list(boxes)
+    scored = []
+    for idx, box in enumerate(boxes):
+        conf = None
+        if hasattr(box, "get_confidence"):
+            try:
+                conf = float(box.get_confidence())
+            except Exception:
+                conf = None
+        if conf is None:
+            try:
+                conf = float(getattr(box, "confidence", 0.0) or 0.0)
+            except Exception:
+                conf = 0.0
+        scored.append((conf, idx))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    keep_idx = [idx for _, idx in scored[: int(k)]]
+    return [boxes[i] for i in keep_idx]
+
+
 def _extract_agent_indices_by_str(all_agent_ids: Sequence[Any], ego_id: Any, cav_id: Any) -> Optional[Tuple[int, int]]:
     ego_str = str(ego_id)
     cav_str = str(cav_id)
@@ -304,7 +326,9 @@ def _estimate_occ_hint(
     if H <= 0 or W <= 0:
         return None
 
-    max_dim = 128
+    # Keep higher spatial resolution for more accurate translation/yaw hints.
+    # The default 256x256 BEV grid is still cheap to process with FFT.
+    max_dim = 256
     stride = int(np.ceil(max(H, W) / float(max_dim))) if max(H, W) > max_dim else 1
     if stride > 1:
         occ_src = occ_src[::stride, ::stride]
@@ -388,7 +412,7 @@ def _estimate_occ_hint(
         if len(coarse) > 1:
             second_peak = float(coarse[1][0])
         top_n = min(5, len(coarse))
-        refine_step = max(1.0, float(rotation_step_deg) / 3.0)
+        refine_step = max(0.5, float(rotation_step_deg) / 10.0)
         refine_radius = float(rotation_step_deg)
         for peak0, angle0, _, _ in coarse[:top_n]:
             angle_min = max(-rotation_max_deg, angle0 - refine_radius)
@@ -410,6 +434,29 @@ def _estimate_occ_hint(
                     best_shift_row = shift_row
                     best_shift_col = shift_col
                     best_yaw = float(angle)
+
+        # Final local refinement around the best yaw for sub-degree accuracy.
+        fine_step = max(0.25, float(rotation_step_deg) / 30.0)
+        fine_radius = max(1.0, min(2.0, float(rotation_step_deg)))
+        angle_min = max(-rotation_max_deg, best_yaw - fine_radius)
+        angle_max = min(rotation_max_deg, best_yaw + fine_radius)
+        fine_angles = np.arange(angle_min, angle_max + 1e-3, fine_step, dtype=np.float32)
+        for angle in fine_angles.tolist():
+            rotated = _rotate(
+                occ_src,
+                angle=float(angle),
+                reshape=False,
+                order=1,
+                mode="constant",
+                cval=0.0,
+                prefilter=False,
+            )
+            peak, shift_row, shift_col = _phase_corr(rotated, Fb_conj)
+            if peak > best_peak:
+                best_peak = peak
+                best_shift_row = shift_row
+                best_shift_col = shift_col
+                best_yaw = float(angle)
     else:
         best_peak, best_shift_row, best_shift_col = _phase_corr(occ_src, Fb_conj)
 
@@ -554,12 +601,16 @@ class Stage1V2XRegPPPoseCorrector:
     config_path: str
     stage1_field: str = "pred_corner3d_np_list"
     bbox_type: str = "detected"
+    max_boxes: int = 0
     mode: str = "initfree"  # initfree | stable
     use_occ_hint: bool = False
     use_occ_pose: bool = False
     force_occ_pose: bool = False
     occ_from_lidar: bool = False
     occ_grid_hw: Tuple[int, int] = (256, 256)
+    # Keep square pixels in physical space (important for yaw estimation via pixel-space rotation).
+    # When occ_grid_hw is square, we will automatically adjust W/H to match bev_range aspect ratio.
+    occ_preserve_aspect: bool = True
     occ_max_delta_xy_m: float = 20.0
     occ_max_delta_yaw_deg: float = 45.0
     icp_refine: bool = False
@@ -568,6 +619,9 @@ class Stage1V2XRegPPPoseCorrector:
     icp_max_iterations: int = 30
     min_matches: int = 3
     min_stability: float = 0.0
+    # Absolute quality gate on CorrespondingDetector precision. Keep at 0 to disable.
+    # This is intentionally independent of the current (potentially noisy) pose.
+    min_precision: float = 0.0
     apply_if_current_precision_below: float = -1.0
     min_precision_improvement: float = 0.1
     min_matched_improvement: int = 1
@@ -576,6 +630,15 @@ class Stage1V2XRegPPPoseCorrector:
     max_step_yaw_deg: float = 10.0
     freeze_ego: bool = True
     _state: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+    # Cache the estimated relative transform per (sample_idx, cav_id) so noise sweeps
+    # don't re-run expensive matching/occ correlation for each noise level.
+    #
+    # This is safe as long as the estimator inputs (stage1 boxes / raw lidar) do not
+    # change across sweeps, which is the case in `inference_w_noise.py` where only
+    # `lidar_pose` is perturbed.
+    _rel_T_est_cache: Dict[Tuple[int, str], Optional[np.ndarray]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         ensure_v2xreg_root_on_path()
@@ -595,11 +658,13 @@ class Stage1V2XRegPPPoseCorrector:
 
         self.min_matches = max(1, int(self.min_matches or 1))
         self.min_stability = float(self.min_stability or 0.0)
+        self.min_precision = max(0.0, float(self.min_precision or 0.0))
         self.apply_if_current_precision_below = float(self.apply_if_current_precision_below)
         self.min_precision_improvement = float(self.min_precision_improvement or 0.0)
         self.min_matched_improvement = max(0, int(self.min_matched_improvement or 0))
         self.ema_alpha = float(self.ema_alpha or 0.0)
         self.ema_alpha = float(np.clip(self.ema_alpha, 0.0, 1.0))
+        self.max_boxes = max(0, int(self.max_boxes or 0))
         self.max_step_xy_m = float(self.max_step_xy_m or 0.0)
         self.max_step_yaw_deg = float(self.max_step_yaw_deg or 0.0)
         self.use_occ_hint = bool(self.use_occ_hint)
@@ -607,6 +672,7 @@ class Stage1V2XRegPPPoseCorrector:
         self.force_occ_pose = bool(self.force_occ_pose)
         self.occ_from_lidar = bool(self.occ_from_lidar)
         self.occ_grid_hw = _as_hw(self.occ_grid_hw)
+        self.occ_preserve_aspect = bool(self.occ_preserve_aspect)
         self.occ_max_delta_xy_m = float(self.occ_max_delta_xy_m or 0.0)
         self.occ_max_delta_yaw_deg = float(self.occ_max_delta_yaw_deg or 0.0)
         self.icp_refine = bool(self.icp_refine)
@@ -977,6 +1043,17 @@ class Stage1V2XRegPPPoseCorrector:
         cand_aligned = _quality(matches_aligned, stability_aligned, "aligned")
         if cand_aligned is not None:
             candidates.append(cand_aligned)
+
+        # When requested, also treat the occ-hint as an explicit pose candidate and refine
+        # correspondences under that hypothesis. This helps reduce reliance on the current pose
+        # and can improve robustness when pure box matching is ambiguous.
+        if self.use_occ_pose and T_hint is not None:
+            cand_occ_refined = _quality_from_T_init(T_hint, "occ_refined")
+            if cand_occ_refined is not None:
+                if occ_hint is not None:
+                    cand_occ_refined.update({f"occ_{k}": v for k, v in occ_hint.items() if k != "T"})
+                candidates.append(cand_occ_refined)
+
         if self.use_occ_pose and T_hint is not None:
             cand_occ = _quality_fixed_T(T_hint, "occ")
             if cand_occ is not None:
@@ -1080,6 +1157,22 @@ class Stage1V2XRegPPPoseCorrector:
             return False
 
         bev_range = stage1_content.get("bev_range") or [-102.4, -51.2, -3.5, 102.4, 51.2, 1.5]
+        # For occ-hint, yaw is estimated by rotating the pixel grid. This only matches physical
+        # yaw when pixels represent square meters. If the user configured a square grid (H==W),
+        # we adjust W/H to match bev_range aspect ratio so resolution_x == resolution_y.
+        occ_grid_hw = self.occ_grid_hw
+        if self.occ_preserve_aspect:
+            try:
+                H, W = _as_hw(occ_grid_hw)
+                if int(H) > 0 and int(W) == int(H):
+                    extent_x = float(bev_range[3]) - float(bev_range[0])
+                    extent_y = float(bev_range[4]) - float(bev_range[1])
+                    if extent_y > 1e-6 and extent_x > 1e-6:
+                        W_new = int(round(float(H) * extent_x / extent_y))
+                        if W_new > 0:
+                            occ_grid_hw = (int(H), int(W_new))
+            except Exception:
+                occ_grid_hw = self.occ_grid_hw
         lidar_occ_cache: Dict[Any, Optional[np.ndarray]] = {}
 
         updated_any = False
@@ -1105,32 +1198,6 @@ class Stage1V2XRegPPPoseCorrector:
                 continue
             ego_idx, cav_idx = idx_pair
 
-            dst_boxes = _extract_boxes(stage1_content, agent_idx=ego_idx, field=self.stage1_field, bbox_type=self.bbox_type)
-            src_boxes = _extract_boxes(stage1_content, agent_idx=cav_idx, field=self.stage1_field, bbox_type=self.bbox_type)
-
-            occ_dst = None
-            occ_src = None
-            if self.use_occ_hint or self.use_occ_pose:
-                occ_dst = _extract_occ_map(stage1_content, agent_idx=ego_idx)
-                occ_src = _extract_occ_map(stage1_content, agent_idx=cav_idx)
-            if self.occ_from_lidar:
-                if occ_dst is None:
-                    if ego_id not in lidar_occ_cache:
-                        lidar_occ_cache[ego_id] = _build_lidar_occ_map(
-                                base_data_dict.get(ego_id, {}).get("lidar_np"),
-                                bev_range=bev_range,
-                                grid_hw=self.occ_grid_hw,
-                            )
-                        occ_dst = lidar_occ_cache.get(ego_id)
-                    if occ_src is None:
-                        if cav_id not in lidar_occ_cache:
-                            lidar_occ_cache[cav_id] = _build_lidar_occ_map(
-                                base_data_dict.get(cav_id, {}).get("lidar_np"),
-                                bev_range=bev_range,
-                                grid_hw=self.occ_grid_hw,
-                            )
-                        occ_src = lidar_occ_cache.get(cav_id)
-
             rel_key = str(cav_id)
             prev_delta = self._get_prev_delta(rel_key) if self.mode == "stable" else None
 
@@ -1138,31 +1205,91 @@ class Stage1V2XRegPPPoseCorrector:
             cav_T_world_current = pose_to_tfm(np.asarray([cav_pose_current], dtype=np.float64))[0]
             rel_current_T = np.linalg.inv(ego_T_world) @ cav_T_world_current
 
-            est = self._estimate_rel_T(src_boxes, dst_boxes, occ_src, occ_dst, bev_range, T_current=rel_current_T)
-
             rel_T_corrected: Optional[np.ndarray] = None
             rel_T_est: Optional[np.ndarray] = None
 
-            if est is not None:
-                if self.icp_refine:
-                    T_init = np.asarray(est.get("T"), dtype=np.float64)
-                    T_icp = _icp_refine_T(
-                        base_data_dict.get(cav_id, {}).get("lidar_np"),
-                        base_data_dict.get(ego_id, {}).get("lidar_np"),
-                        T_init=T_init,
-                        voxel_size_m=self.icp_voxel_size_m,
-                        max_corr_dist_m=self.icp_max_corr_dist_m,
-                        max_iterations=self.icp_max_iterations,
-                    )
-                    if T_icp is not None:
-                        est["T"] = T_icp
-                rel_T_est = np.asarray(est.get("T"), dtype=np.float64) if est.get("T") is not None else None
+            cache_key = (int(sample_idx), str(cav_id))
+            missing = object()
+            cached = self._rel_T_est_cache.get(cache_key, missing)
+            if cached is not missing:
+                rel_T_est = None if cached is None else np.asarray(cached, dtype=np.float64)
+            else:
+                dst_boxes = _extract_boxes(
+                    stage1_content, agent_idx=ego_idx, field=self.stage1_field, bbox_type=self.bbox_type
+                )
+                src_boxes = _extract_boxes(
+                    stage1_content, agent_idx=cav_idx, field=self.stage1_field, bbox_type=self.bbox_type
+                )
+                if int(self.max_boxes or 0) > 0:
+                    dst_boxes = _topk_by_confidence(dst_boxes, int(self.max_boxes))
+                    src_boxes = _topk_by_confidence(src_boxes, int(self.max_boxes))
 
-                if str(est.get("source")) != "occ":
-                    matches_count = int(est.get("matched") or len(est.get("matches") or []))
-                    stability = float(est.get("stability") or 0.0)
-                    if matches_count < self.min_matches or stability < self.min_stability:
-                        rel_T_est = None
+                occ_dst = None
+                occ_src = None
+                if self.use_occ_hint or self.use_occ_pose:
+                    occ_dst = _extract_occ_map(stage1_content, agent_idx=ego_idx)
+                    occ_src = _extract_occ_map(stage1_content, agent_idx=cav_idx)
+                if self.occ_from_lidar:
+                    if occ_dst is None:
+                        if ego_id not in lidar_occ_cache:
+                            lidar_occ_cache[ego_id] = _build_lidar_occ_map(
+                                base_data_dict.get(ego_id, {}).get("lidar_np"),
+                                bev_range=bev_range,
+                                grid_hw=occ_grid_hw,
+                            )
+                        occ_dst = lidar_occ_cache.get(ego_id)
+                    if occ_src is None:
+                        if cav_id not in lidar_occ_cache:
+                            lidar_occ_cache[cav_id] = _build_lidar_occ_map(
+                                base_data_dict.get(cav_id, {}).get("lidar_np"),
+                                bev_range=bev_range,
+                                grid_hw=occ_grid_hw,
+                            )
+                        occ_src = lidar_occ_cache.get(cav_id)
+
+                # "initfree" should be independent of the (potentially noisy) current pose, otherwise
+                # the update decision can vary with injected noise even if the estimator itself doesn't.
+                # We keep T_current for stable mode (used for delta correction), but avoid it for initfree.
+                T_current_for_est = rel_current_T if self.mode == "stable" else None
+                est = self._estimate_rel_T(
+                    src_boxes,
+                    dst_boxes,
+                    occ_src,
+                    occ_dst,
+                    bev_range,
+                    T_current=T_current_for_est,
+                )
+
+                if est is not None:
+                    if self.icp_refine:
+                        T_init = np.asarray(est.get("T"), dtype=np.float64)
+                        T_icp = _icp_refine_T(
+                            base_data_dict.get(cav_id, {}).get("lidar_np"),
+                            base_data_dict.get(ego_id, {}).get("lidar_np"),
+                            T_init=T_init,
+                            voxel_size_m=self.icp_voxel_size_m,
+                            max_corr_dist_m=self.icp_max_corr_dist_m,
+                            max_iterations=self.icp_max_iterations,
+                        )
+                        if T_icp is not None:
+                            est["T"] = T_icp
+                    rel_T_est = np.asarray(est.get("T"), dtype=np.float64) if est.get("T") is not None else None
+
+                    if str(est.get("source")) != "occ":
+                        matches_count = int(est.get("matched") or len(est.get("matches") or []))
+                        stability = float(est.get("stability") or 0.0)
+                        if matches_count < self.min_matches or stability < self.min_stability:
+                            rel_T_est = None
+
+                    if rel_T_est is not None and self.min_precision > 0.0:
+                        try:
+                            precision = float(est.get("precision") or 0.0)
+                        except Exception:
+                            precision = 0.0
+                        if precision < float(self.min_precision) - 1e-9:
+                            rel_T_est = None
+
+                self._rel_T_est_cache[cache_key] = None if rel_T_est is None else np.asarray(rel_T_est, dtype=np.float64)
 
             if self.mode == "stable":
                 if rel_T_est is not None:

@@ -14,6 +14,8 @@ from opencood.extrinsics.late_fusion.v2xregpp import V2XRegPPEstimator
 from opencood.extrinsics.path_utils import resolve_repo_path
 from opencood.pose.freealign_paper import FreeAlignPaperConfig, FreeAlignPaperEstimator
 from opencood.pose.freealign_repo import FreeAlignRepoConfig, FreeAlignRepoEstimator
+from opencood.utils.box_utils import project_box3d
+from opencood.utils.transformation_utils import x1_to_x2
 
 
 def _as_T_from_rt(rotation, translation) -> np.ndarray:
@@ -126,6 +128,88 @@ def _extract_dual_agent(entry: Dict[str, Any]) -> Tuple[np.ndarray, Optional[Lis
     return infra_c, infra_s, veh_c, veh_s
 
 
+def _extract_agent_by_index(entry: Dict[str, Any], agent_idx: int) -> Tuple[np.ndarray, Optional[List[float]]]:
+    corners_all = entry.get("pred_corner3d_np_list") or []
+    scores_all = entry.get("pred_score_np_list") or []
+    if not isinstance(corners_all, list) or agent_idx < 0 or agent_idx >= len(corners_all):
+        return np.zeros((0, 8, 3), dtype=np.float32), None
+    corners_list = corners_all[agent_idx] or []
+    corners = (
+        np.asarray(corners_list, dtype=np.float32).reshape(-1, 8, 3)
+        if corners_list
+        else np.zeros((0, 8, 3), dtype=np.float32)
+    )
+    scores = None
+    if isinstance(scores_all, list) and agent_idx < len(scores_all) and isinstance(scores_all[agent_idx], list):
+        try:
+            scores = [float(x) for x in scores_all[agent_idx]]
+        except Exception:
+            scores = None
+    return corners, scores
+
+
+def _frame_id_to_int(frame_id: Any) -> Optional[int]:
+    if frame_id is None:
+        return None
+    try:
+        return int(str(frame_id))
+    except Exception:
+        return None
+
+
+def _extract_pose(entry: Dict[str, Any], agent_idx: int, use_clean: bool) -> Optional[Sequence[float]]:
+    key = "lidar_pose_clean_np" if use_clean else "lidar_pose_np"
+    poses = entry.get(key)
+    if not isinstance(poses, list) or agent_idx < 0 or agent_idx >= len(poses):
+        return None
+    pose = poses[agent_idx]
+    if not isinstance(pose, (list, tuple)) or len(pose) < 6:
+        return None
+    return pose
+
+
+def _transform_boxes(boxes: Sequence[object], T_cur_from_past: np.ndarray) -> List[object]:
+    if not boxes:
+        return []
+    corners = []
+    scores = []
+    bbox_type = None
+    for bbox in boxes:
+        try:
+            corners.append(np.asarray(bbox.get_bbox3d_8_3(), dtype=np.float32))
+            scores.append(float(getattr(bbox, "confidence", 1.0)))
+            if bbox_type is None:
+                bbox_type = str(bbox.get_bbox_type())
+        except Exception:
+            continue
+    if not corners:
+        return []
+    corners_np = np.stack(corners, axis=0)
+    projected = project_box3d(corners_np, T_cur_from_past)
+    return corners_to_bbox3d_list(projected, bbox_type=bbox_type or "detected", scores=scores)
+
+
+def _build_time_index(stage1_cache: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    time_index: Dict[str, List[Tuple[int, str]]] = {}
+    for key, entry in stage1_cache.items():
+        if not isinstance(entry, dict):
+            continue
+        veh_frame = _frame_id_to_int(entry.get("veh_frame_id"))
+        infra_frame = _frame_id_to_int(entry.get("infra_frame_id"))
+        if veh_frame is not None:
+            time_index.setdefault("vehicle", []).append((int(veh_frame), str(key)))
+        if infra_frame is not None:
+            time_index.setdefault("infrastructure", []).append((int(infra_frame), str(key)))
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for role, pairs in time_index.items():
+        pairs.sort(key=lambda x: x[0])
+        frames = [p[0] for p in pairs]
+        keys = [p[1] for p in pairs]
+        pos_map = {int(frame): int(idx) for idx, frame in enumerate(frames)}
+        resolved[str(role)] = {"frames": frames, "keys": keys, "pos_map": pos_map}
+    return resolved
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     group = ap.add_mutually_exclusive_group(required=True)
@@ -150,8 +234,14 @@ def main() -> None:
     ap.add_argument("--freealign_paper_sim_threshold", type=float, default=0.8)
     ap.add_argument("--freealign_paper_p", type=float, default=1.0)
     ap.add_argument("--freealign_paper_use_gnn", action="store_true")
+    ap.add_argument("--freealign_paper_gnn_type", type=str, default="lite", choices=["lite", "egat"])
+    ap.add_argument("--freealign_paper_gnn_heads", type=int, default=4)
+    ap.add_argument("--freealign_paper_gnn_dropout", type=float, default=0.0)
     ap.add_argument("--freealign_paper_ckpt_path", type=str, default=None)
     ap.add_argument("--freealign_paper_device", type=str, default="cpu")
+    ap.add_argument("--freealign_paper_time_buffer", type=int, default=0, help="Temporal buffer length l (0 disables).")
+    ap.add_argument("--freealign_paper_time_stride", type=int, default=1, help="Stride between buffer steps (frames).")
+    ap.add_argument("--freealign_paper_time_use_clean_pose", type=int, default=1, help="Use lidar_pose_clean_np for odometry (1/0).")
 
     # FreeAlign (released repo matching: match_v7_with_detection).
     ap.add_argument("--freealign_repo_max_boxes", type=int, default=60)
@@ -186,6 +276,9 @@ def main() -> None:
         else str(resolve_repo_path(args.freealign_paper_ckpt_path)),
         device=str(args.freealign_paper_device),
         use_gnn=bool(args.freealign_paper_use_gnn),
+        gnn_type=str(args.freealign_paper_gnn_type or "lite"),
+        gnn_heads=int(args.freealign_paper_gnn_heads),
+        gnn_dropout=float(args.freealign_paper_gnn_dropout),
         max_boxes=int(args.freealign_paper_max_boxes),
         anchor_topk=int(args.freealign_paper_anchor_topk),
         seed_strategy=str(args.freealign_paper_seed_strategy),
@@ -193,6 +286,9 @@ def main() -> None:
         anchor_max_count=int(args.freealign_paper_anchor_max_count),
         sim_threshold=float(args.freealign_paper_sim_threshold),
         p=float(args.freealign_paper_p),
+        time_buffer=int(args.freealign_paper_time_buffer),
+        time_stride=int(args.freealign_paper_time_stride),
+        time_use_clean_pose=bool(int(args.freealign_paper_time_use_clean_pose)),
     )
     freealign_paper_est = FreeAlignPaperEstimator(freealign_paper_cfg)
 
@@ -213,17 +309,21 @@ def main() -> None:
     v2xregpp_est = V2XRegPPEstimator(config_path=str(args.v2xregpp_config), matching_overrides=overrides or None)
 
     samples: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    stage1_cache = None
+    time_index = None
     if args.stage1_cache:
         cache_path = resolve_repo_path(args.stage1_cache)
-        data = json.loads(cache_path.read_text())
-        if not isinstance(data, dict):
+        stage1_cache = json.loads(cache_path.read_text())
+        if not isinstance(stage1_cache, dict):
             raise ValueError("stage1_cache must be a dict JSON")
-        keys = sorted(data.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x))
+        keys = sorted(stage1_cache.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x))
         if args.max_samples:
             keys = keys[: int(args.max_samples)]
         for k in keys:
-            entry = data.get(k) or {}
+            entry = stage1_cache.get(k) or {}
             samples.append((str(k), entry, entry))
+        if int(args.freealign_paper_time_buffer) > 0:
+            time_index = _build_time_index(stage1_cache)
     else:
         if not args.stage1_exports or not args.veh_stage1 or not args.infra_stage1:
             raise SystemExit("When using --stage1_exports, set --veh_stage1 and --infra_stage1.")
@@ -272,9 +372,70 @@ def main() -> None:
         }
 
         # FreeAlign (paper reconstruction)
-        fa_paper_T, _, fa_paper_matches, fa_paper_meta = freealign_paper_est.estimate(
-            cav_boxes=infra_boxes, ego_boxes=veh_boxes, T_init=None
-        )
+        fa_paper_T = None
+        fa_paper_matches = 0
+        fa_paper_meta = {}
+        time_buffer = int(args.freealign_paper_time_buffer or 0)
+        if time_buffer > 0 and time_index and stage1_cache:
+            cur_frame = _frame_id_to_int(veh_frame)
+            idx_map = time_index.get("vehicle", {}).get("pos_map", {})
+            keys = time_index.get("vehicle", {}).get("keys", [])
+            pos = idx_map.get(int(cur_frame)) if cur_frame is not None else None
+            if pos is not None:
+                use_clean = bool(int(args.freealign_paper_time_use_clean_pose))
+                cur_pose = _extract_pose(infra_entry, _infer_pair_indices(infra_entry.get("cav_id_list"))[1], use_clean)
+                best_T = None
+                best_eps = float("inf")
+                best_matches = -1
+                best_meta = {}
+                best_step = None
+                for step in range(0, time_buffer + 1):
+                    pos_k = int(pos - step * max(1, int(args.freealign_paper_time_stride)))
+                    if pos_k < 0:
+                        break
+                    key_k = keys[pos_k]
+                    entry_k = stage1_cache.get(str(key_k))
+                    if not isinstance(entry_k, dict):
+                        continue
+                    infra_idx_k, veh_idx_k = _infer_pair_indices(entry_k.get("cav_id_list"))
+                    veh_c_k, veh_s_k = _extract_agent_by_index(entry_k, veh_idx_k)
+                    veh_boxes_k = corners_to_bbox3d_list(veh_c_k, bbox_type="detected", scores=veh_s_k)
+                    if not veh_boxes_k:
+                        continue
+                    if cur_pose is not None:
+                        past_pose = _extract_pose(entry_k, veh_idx_k, use_clean)
+                        if past_pose is not None:
+                            T_cur_from_past = x1_to_x2(past_pose, cur_pose)
+                            veh_boxes_k = _transform_boxes(veh_boxes_k, T_cur_from_past)
+                            if not veh_boxes_k:
+                                continue
+                    T_est, _, matches, meta = freealign_paper_est.estimate(
+                        cav_boxes=infra_boxes, ego_boxes=veh_boxes_k, T_init=None
+                    )
+                    if T_est is None:
+                        continue
+                    eps = float((meta or {}).get("eps", float("inf")))
+                    if eps < best_eps - 1e-9 or (abs(eps - best_eps) <= 1e-9 and matches > best_matches):
+                        best_T = np.asarray(T_est, dtype=np.float64)
+                        best_eps = float(eps)
+                        best_matches = int(matches)
+                        best_meta = dict(meta or {})
+                        best_step = int(step)
+                if best_T is not None:
+                    best_meta.update(
+                        {
+                            "time_offset_steps": int(best_step if best_step is not None else 0),
+                            "time_buffer": int(time_buffer),
+                            "time_stride": int(args.freealign_paper_time_stride),
+                        }
+                    )
+                    fa_paper_T = best_T
+                    fa_paper_matches = int(best_matches)
+                    fa_paper_meta = best_meta
+        if fa_paper_T is None:
+            fa_paper_T, _, fa_paper_matches, fa_paper_meta = freealign_paper_est.estimate(
+                cav_boxes=infra_boxes, ego_boxes=veh_boxes, T_init=None
+            )
         rec["freealign_paper"] = {
             "success": bool(fa_paper_T is not None),
             "matches": int(fa_paper_matches),

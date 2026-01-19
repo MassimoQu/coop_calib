@@ -280,12 +280,19 @@ def setup_optimizer(hypes, model):
     optimizer_method = getattr(optim, method_dict['core_method'], None)
     if not optimizer_method:
         raise ValueError('{} is not supported'.format(method_dict['name']))
+    # Filter frozen parameters to avoid allocating optimizer state for them.
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError(
+            "No trainable parameters found (all parameters have requires_grad=False). "
+            "Check your freeze/trainable_modules settings."
+        )
     if 'args' in method_dict:
-        return optimizer_method(model.parameters(),
+        return optimizer_method(params,
                                 lr=method_dict['lr'],
                                 **method_dict['args'])
     else:
-        return optimizer_method(model.parameters(),
+        return optimizer_method(params,
                                 lr=method_dict['lr'])
 
 

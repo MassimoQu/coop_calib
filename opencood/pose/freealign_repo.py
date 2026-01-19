@@ -203,6 +203,12 @@ class FreeAlignRepoConfig:
     box_error: float = 0.5
     min_nodes: int = 3
 
+    # Optional temporal smoothing (mirrors v2xregpp_stable "delta SE(2)" smoothing).
+    mode: str = "initfree"  # initfree | stable
+    ema_alpha: float = 0.5
+    max_step_xy_m: float = 3.0
+    max_step_yaw_deg: float = 10.0
+
 
 class FreeAlignRepoEstimator:
     def __init__(self, cfg: Optional[FreeAlignRepoConfig] = None) -> None:
@@ -248,4 +254,3 @@ class FreeAlignRepoEstimator:
 
 
 __all__ = ["FreeAlignRepoConfig", "FreeAlignRepoEstimator"]
-

@@ -323,7 +323,7 @@ class V2XViTFusion(nn.Module):
         from opencood.models.sub_modules.v2xvit_basic import V2XTransformer
         self.fusion_net = V2XTransformer(args['transformer'])
 
-    def forward(self, x, record_len, affine_matrix):
+    def forward(self, x, record_len, affine_matrix, pairwise_t_matrix=None):
         """
         Fusion forwarding.
         
@@ -365,7 +365,12 @@ class V2XViTFusion(nn.Module):
         # transformer fusion. In perfect setting, there is no delay. 
         # it is possible to modify the xxx_basedataset.py and intermediatefusiondataset.py to retrieve these information
         spatial_correction_matrix = torch.eye(4).expand(len(record_len), L, 4, 4).to(record_len.device)
-        fused_feature = self.fusion_net(regroup_feature, mask, spatial_correction_matrix)
+        fused_feature = self.fusion_net(
+            regroup_feature,
+            mask,
+            spatial_correction_matrix,
+            pairwise_t_matrix=pairwise_t_matrix,
+        )
         # b h w c -> b c h w
         fused_feature = fused_feature.permute(0, 3, 1, 2)
         

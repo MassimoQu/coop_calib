@@ -196,6 +196,66 @@ class EdgeGATLite(nn.Module):
         return e1
 
 
+class EdgeGAT(nn.Module):
+    """
+    EdgeGAT-style edge feature learner with attention over fully-connected edges.
+
+    Input: pairwise distance matrix D (N,N)
+    Output: edge feature tensor W (N,N,K)
+    """
+
+    def __init__(self, *, hidden_dim: int = 64, out_dim: int = 16, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        self.num_heads = max(1, int(num_heads))
+        if self.hidden_dim % self.num_heads != 0:
+            raise ValueError(f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})")
+        self.head_dim = self.hidden_dim // self.num_heads
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(1, self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.value_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.attn_proj = nn.Linear(self.hidden_dim, self.num_heads, bias=False)
+        self.out_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+        self.dropout = nn.Dropout(float(dropout)) if float(dropout) > 0.0 else None
+
+    def forward(self, D: torch.Tensor) -> torch.Tensor:
+        if D.ndim != 2:
+            raise ValueError(f"Expected D to be 2D (N,N), got {tuple(D.shape)}")
+        N = int(D.shape[0])
+        if N == 0:
+            return D.new_zeros((0, 0, int(self.out_dim)))
+
+        d_in = D.unsqueeze(-1)  # (N,N,1)
+        e0 = self.edge_mlp(d_in)  # (N,N,H)
+        if self.dropout is not None:
+            e0 = self.dropout(e0)
+
+        attn_logits = self.attn_proj(e0)  # (N,N,heads)
+        attn = torch.softmax(attn_logits, dim=1)  # normalize over neighbors
+
+        v = self.value_proj(e0)  # (N,N,H)
+        v = v.view(N, N, self.num_heads, self.head_dim)
+        attn = attn.unsqueeze(-1)  # (N,N,heads,1)
+        h = (attn * v).sum(dim=1)  # (N,heads,head_dim)
+        h = h.reshape(N, self.hidden_dim)
+
+        h_i = h.unsqueeze(1).expand(N, N, -1)
+        h_j = h.unsqueeze(0).expand(N, N, -1)
+        e1 = self.out_mlp(torch.cat([e0, h_i, h_j], dim=-1))
+        # Symmetrize to reduce order sensitivity.
+        e1 = 0.5 * (e1 + e1.transpose(0, 1))
+        return e1
+
+
 @dataclass(frozen=True)
 class FreeAlignPaperConfig:
     ckpt_path: Optional[str] = None
@@ -203,6 +263,9 @@ class FreeAlignPaperConfig:
     hidden_dim: int = 64
     out_dim: int = 16
     use_gnn: bool = False
+    gnn_type: str = "lite"  # lite | egat
+    gnn_heads: int = 4
+    gnn_dropout: float = 0.0
     max_boxes: int = 60
     anchor_topk: int = 10
     seed_strategy: str = "topk_radius"  # "topk_radius" | "all"
@@ -224,6 +287,19 @@ class FreeAlignPaperConfig:
     refit_rigid: bool = True
     min_inliers: int = 3
 
+    # Optional temporal smoothing (mirrors v2xregpp_stable "delta SE(2)" smoothing).
+    # "initfree": apply per-frame estimate directly; "stable": smooth correction deltas over time.
+    mode: str = "initfree"  # initfree | stable
+    ema_alpha: float = 0.5
+    max_step_xy_m: float = 3.0
+    max_step_yaw_deg: float = 10.0
+
+    # Optional temporal alignment (search over ego time buffer).
+    # time_buffer = number of historical steps (l in [t, t-τ, ..., t-lτ]); 0 disables.
+    time_buffer: int = 0
+    time_stride: int = 1
+    time_use_clean_pose: bool = True
+
 
 class FreeAlignPaperEstimator:
     def __init__(self, cfg: FreeAlignPaperConfig):
@@ -231,7 +307,16 @@ class FreeAlignPaperEstimator:
         self.device = torch.device(str(cfg.device))
         self.net = None
         if bool(cfg.use_gnn):
-            self.net = EdgeGATLite(hidden_dim=int(cfg.hidden_dim), out_dim=int(cfg.out_dim))
+            gnn_type = str(getattr(cfg, "gnn_type", "lite") or "lite").lower().strip()
+            if gnn_type in {"egat", "edgegat", "full"}:
+                self.net = EdgeGAT(
+                    hidden_dim=int(cfg.hidden_dim),
+                    out_dim=int(cfg.out_dim),
+                    num_heads=int(cfg.gnn_heads),
+                    dropout=float(cfg.gnn_dropout),
+                )
+            else:
+                self.net = EdgeGATLite(hidden_dim=int(cfg.hidden_dim), out_dim=int(cfg.out_dim))
             self.net.eval()
             self.net.to(self.device)
             if cfg.ckpt_path:

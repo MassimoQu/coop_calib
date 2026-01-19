@@ -84,9 +84,12 @@ def load_voxel_params(param):
     anchor_args['vh'] = vh
     anchor_args['vd'] = vd
 
-    anchor_args['W'] = int((cav_lidar_range[3] - cav_lidar_range[0]) / vw)
-    anchor_args['H'] = int((cav_lidar_range[4] - cav_lidar_range[1]) / vh)
-    anchor_args['D'] = int((cav_lidar_range[5] - cav_lidar_range[2]) / vd)
+    # Use rounding instead of floor int() to avoid off-by-one issues caused by
+    # float representation (e.g., 76.8/0.4 -> 191.999999...). This keeps anchor
+    # grid sizes consistent with scatter/grid_size computations used by models.
+    anchor_args['W'] = int(np.round((cav_lidar_range[3] - cav_lidar_range[0]) / vw))
+    anchor_args['H'] = int(np.round((cav_lidar_range[4] - cav_lidar_range[1]) / vh))
+    anchor_args['D'] = int(np.round((cav_lidar_range[5] - cav_lidar_range[2]) / vd))
 
     param['postprocess'].update({'anchor_args': anchor_args})
 

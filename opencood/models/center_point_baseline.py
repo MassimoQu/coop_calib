@@ -133,7 +133,13 @@ class CenterPointBaseline(nn.Module):
         if self.compression:
             spatial_features_2d = self.naive_compressor(spatial_features_2d)
 
-        fused_feature = self.fusion_net(spatial_features_2d, record_len, t_matrix)
+        if self.fusion_method == 'v2xvit':
+            fused_feature = self.fusion_net(spatial_features_2d,
+                                            record_len,
+                                            t_matrix,
+                                            data_dict.get('pairwise_t_matrix'))
+        else:
+            fused_feature = self.fusion_net(spatial_features_2d, record_len, t_matrix)
 
         cls = self.cls_head(fused_feature)
         bbox = self.reg_head(fused_feature)

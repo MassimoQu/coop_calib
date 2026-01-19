@@ -21,9 +21,9 @@ from opencood.utils.transformation_utils import pose_to_tfm
 from opencood.visualization import vis_utils, my_vis, simple_vis
 
 torch.multiprocessing.set_sharing_strategy('file_system')
-warnings.filterwarnings("ignore", category=RuntimeWarning, module=r"shapely\\..*")
-warnings.filterwarnings("ignore", message=r".*invalid value encountered in intersection.*", category=RuntimeWarning)
-warnings.filterwarnings("ignore", message=r".*nn\\.functional\\.sigmoid is deprecated.*", category=UserWarning)
+# This script can emit extremely noisy warnings (e.g., torch deprecated sigmoid)
+# at every iteration, which slows evaluation drastically and floods stdout.
+warnings.filterwarnings("ignore")
 
 def _parse_float_list(raw: str):
     values = []
@@ -91,7 +91,21 @@ def test_parser():
     )
     parser.add_argument(
         "--pose-correction",
-        choices=["none", "v2xregpp_initfree", "v2xregpp_stable"],
+        choices=[
+            "none",
+            "v2xregpp_initfree",
+            "v2xregpp_stable",
+            "freealign_paper",
+            "freealign_paper_stable",
+            "freealign_repo",
+            "freealign_repo_stable",
+            # V2VLoc-style pose override/correction from cached pose JSON.
+            "v2vloc_pgc_initfree",
+            "v2vloc_pgc_stable",
+            # Oracle pose override from stage1 cache (uses lidar_pose_clean_np).
+            "v2vloc_oracle_initfree",
+            "v2vloc_oracle_stable",
+        ],
         default="none",
         help="Optional extrinsic correction inside the dataset, before building pairwise transforms.",
     )
@@ -99,7 +113,58 @@ def test_parser():
         "--stage1-result",
         type=str,
         default="",
-        help="Stage1/detection cache JSON used by the pose corrector (required for v2xregpp_*).",
+        help="Cache JSON used by the pose corrector (required when --pose-correction != none). "
+             "For v2xregpp_* / freealign_* this is a stage1_boxes.json. For v2vloc_pgc_* it is a PGC pose json; "
+             "for v2vloc_oracle_* it can reuse stage1_boxes.json (lidar_pose_clean_np).",
+    )
+    parser.add_argument(
+        "--freealign-max-boxes",
+        type=int,
+        default=60,
+        help="FreeAlign: max number of boxes per agent used for matching.",
+    )
+    parser.add_argument(
+        "--freealign-min-nodes",
+        type=int,
+        default=5,
+        help="FreeAlign(paper): minimum number of nodes/boxes required to attempt matching.",
+    )
+    parser.add_argument(
+        "--freealign-sim-threshold",
+        type=float,
+        default=0.6,
+        help="FreeAlign(paper): similarity threshold used for anchor selection/matching.",
+    )
+    parser.add_argument(
+        "--freealign-affine-method",
+        type=str,
+        default="lmeds",
+        choices=["lmeds", "ransac"],
+        help="FreeAlign(paper): OpenCV estimateAffinePartial2D method.",
+    )
+    parser.add_argument(
+        "--freealign-ransac-reproj-threshold",
+        type=float,
+        default=1.0,
+        help="FreeAlign(paper): RANSAC reprojection threshold (meters) in estimateAffinePartial2D.",
+    )
+    parser.add_argument(
+        "--freealign-min-anchors",
+        type=int,
+        default=3,
+        help="FreeAlign(repo): minimum anchors for initial subgraph match.",
+    )
+    parser.add_argument(
+        "--freealign-anchor-error",
+        type=float,
+        default=0.3,
+        help="FreeAlign(repo): anchor error threshold.",
+    )
+    parser.add_argument(
+        "--freealign-box-error",
+        type=float,
+        default=0.5,
+        help="FreeAlign(repo): box error threshold.",
     )
     parser.add_argument(
         "--v2xregpp-config",
@@ -167,6 +232,12 @@ def test_parser():
     parser.add_argument("--v2xregpp-icp-max-iter", type=int, default=30, help="ICP max iterations.")
     parser.add_argument("--v2xregpp-min-matches", type=int, default=3)
     parser.add_argument("--v2xregpp-min-stability", type=float, default=0.0)
+    parser.add_argument(
+        "--v2xregpp-min-precision",
+        type=float,
+        default=0.0,
+        help="Absolute precision threshold (CorrespondingDetector) required to apply an estimated pose. 0 disables.",
+    )
     parser.add_argument("--v2xregpp-ema-alpha", type=float, default=0.5)
     parser.add_argument("--v2xregpp-max-step-xy", type=float, default=3.0)
     parser.add_argument("--v2xregpp-max-step-yaw", type=float, default=10.0)
@@ -188,6 +259,12 @@ def test_parser():
         default=50,
         help="Print progress every N samples (set 1 to print every sample).",
     )
+    parser.add_argument(
+        "--comm-range-override",
+        type=float,
+        default=None,
+        help="Optional override for hypes['comm_range'] (useful for pose-correction stress tests).",
+    )
     opt = parser.parse_args()
     return opt
 
@@ -197,6 +274,9 @@ def main():
     assert opt.fusion_method in ['late', 'early', 'intermediate', 'no', 'no_w_uncertainty', 'single']
 
     hypes = yaml_utils.load_yaml(None, opt)
+
+    if opt.comm_range_override is not None:
+        hypes["comm_range"] = float(opt.comm_range_override)
     
     hypes['validate_dir'] = hypes['test_dir']
     if "OPV2V" in hypes['test_dir'] or "v2xsim" in hypes['test_dir']:
@@ -242,34 +322,90 @@ def main():
     if pose_correction != "none":
         if not opt.stage1_result:
             raise ValueError("--stage1-result is required when --pose-correction != none")
+        # Ensure we don't accidentally combine multiple alignment blocks.
         hypes.pop("box_align", None)
-        mode = "stable" if pose_correction.endswith("stable") else "initfree"
-        hypes["v2xregpp_align"] = {
-            "train_result": opt.stage1_result,
-            "val_result": opt.stage1_result,
-            "args": {
-                "config_path": opt.v2xregpp_config,
-                "mode": mode,
-                "use_occ_hint": bool(opt.v2xregpp_use_occ_hint),
-                "use_occ_pose": bool(opt.v2xregpp_use_occ_pose),
-                "force_occ_pose": bool(opt.v2xregpp_force_occ_pose),
-                "occ_from_lidar": bool(opt.v2xregpp_occ_from_lidar),
-                "occ_grid_hw": _parse_hw(opt.v2xregpp_occ_grid) or (256, 256),
-                "occ_max_delta_xy_m": float(opt.v2xregpp_occ_max_delta_xy),
-                "occ_max_delta_yaw_deg": float(opt.v2xregpp_occ_max_delta_yaw),
-                "icp_refine": bool(opt.v2xregpp_icp_refine),
-                "icp_voxel_size_m": float(opt.v2xregpp_icp_voxel),
-                "icp_max_corr_dist_m": float(opt.v2xregpp_icp_max_corr),
-                "icp_max_iterations": int(opt.v2xregpp_icp_max_iter),
-                "min_matches": int(opt.v2xregpp_min_matches),
-                "min_stability": float(opt.v2xregpp_min_stability),
-                "ema_alpha": float(opt.v2xregpp_ema_alpha),
-                "max_step_xy_m": float(opt.v2xregpp_max_step_xy),
-                "max_step_yaw_deg": float(opt.v2xregpp_max_step_yaw),
-                "stage1_field": str(opt.v2xregpp_stage1_field or "pred_corner3d_np_list"),
-                "bbox_type": str(opt.v2xregpp_bbox_type or "detected"),
-            },
-        }
+        hypes.pop("v2xregpp_align", None)
+        hypes.pop("freealign_align", None)
+        hypes.pop("pgc_pose", None)
+        if pose_correction.startswith("v2xregpp"):
+            mode = "stable" if pose_correction.endswith("stable") else "initfree"
+            hypes["v2xregpp_align"] = {
+                "train_result": opt.stage1_result,
+                "val_result": opt.stage1_result,
+                "args": {
+                    "config_path": opt.v2xregpp_config,
+                    "mode": mode,
+                    "use_occ_hint": bool(opt.v2xregpp_use_occ_hint),
+                    "use_occ_pose": bool(opt.v2xregpp_use_occ_pose),
+                    "force_occ_pose": bool(opt.v2xregpp_force_occ_pose),
+                    "occ_from_lidar": bool(opt.v2xregpp_occ_from_lidar),
+                    "occ_grid_hw": _parse_hw(opt.v2xregpp_occ_grid) or (256, 256),
+                    "occ_max_delta_xy_m": float(opt.v2xregpp_occ_max_delta_xy),
+                    "occ_max_delta_yaw_deg": float(opt.v2xregpp_occ_max_delta_yaw),
+                    "icp_refine": bool(opt.v2xregpp_icp_refine),
+                    "icp_voxel_size_m": float(opt.v2xregpp_icp_voxel),
+                    "icp_max_corr_dist_m": float(opt.v2xregpp_icp_max_corr),
+                    "icp_max_iterations": int(opt.v2xregpp_icp_max_iter),
+                    "min_matches": int(opt.v2xregpp_min_matches),
+                    "min_stability": float(opt.v2xregpp_min_stability),
+                    "min_precision": float(opt.v2xregpp_min_precision),
+                    "ema_alpha": float(opt.v2xregpp_ema_alpha),
+                    "max_step_xy_m": float(opt.v2xregpp_max_step_xy),
+                    "max_step_yaw_deg": float(opt.v2xregpp_max_step_yaw),
+                    "stage1_field": str(opt.v2xregpp_stage1_field or "pred_corner3d_np_list"),
+                    "bbox_type": str(opt.v2xregpp_bbox_type or "detected"),
+                },
+            }
+        elif pose_correction.startswith("freealign"):
+            backend = "repo" if "repo" in pose_correction else "paper"
+            mode = "stable" if pose_correction.endswith("stable") else "initfree"
+            hypes["freealign_align"] = {
+                "train_result": opt.stage1_result,
+                "val_result": opt.stage1_result,
+                "args": {
+                    "backend": backend,
+                    "mode": mode,
+                    # Reuse V2X-Reg++ stable hyperparams so "stable" means the same across methods.
+                    "ema_alpha": float(opt.v2xregpp_ema_alpha),
+                    "max_step_xy_m": float(opt.v2xregpp_max_step_xy),
+                    "max_step_yaw_deg": float(opt.v2xregpp_max_step_yaw),
+                    "max_boxes": int(opt.freealign_max_boxes),
+                    # Paper configs (repo backend will ignore unknown fields).
+                    "min_nodes": int(opt.freealign_min_nodes),
+                    "sim_threshold": float(opt.freealign_sim_threshold),
+                    "affine_method": str(opt.freealign_affine_method),
+                    "ransac_reproj_threshold": float(opt.freealign_ransac_reproj_threshold),
+                    # Repo configs (paper backend will ignore unknown fields).
+                    "min_anchors": int(opt.freealign_min_anchors),
+                    "anchor_error": float(opt.freealign_anchor_error),
+                    "box_error": float(opt.freealign_box_error),
+                },
+            }
+        elif pose_correction.startswith("v2vloc_"):
+            mode = "stable" if pose_correction.endswith("stable") else "initfree"
+            # We intentionally *don't* write pose_confidence here, so that pose confidence
+            # is computed consistently via `attach_pose_confidence` from (pose - pose_clean)
+            # for all methods, isolating the effect of pose alignment.
+            if "oracle" in pose_correction:
+                pose_field = "lidar_pose_clean_np"
+            else:
+                pose_field = "lidar_pose_pred_np"
+            hypes["pgc_pose"] = {
+                "train_result": opt.stage1_result,
+                "val_result": opt.stage1_result,
+                "args": {
+                    "pose_field": str(pose_field),
+                    "confidence_field": "",
+                    "min_confidence": 0.0,
+                    "mode": str(mode),
+                    "ema_alpha": float(opt.v2xregpp_ema_alpha),
+                    "max_step_xy_m": float(opt.v2xregpp_max_step_xy),
+                    "max_step_yaw_deg": float(opt.v2xregpp_max_step_yaw),
+                    "freeze_ego": True,
+                },
+            }
+        else:
+            raise ValueError(f"Unsupported --pose-correction: {pose_correction}")
 
     
     if opt.also_laplace:
@@ -302,7 +438,13 @@ def main():
         opencood_dataset = build_dataset(hypes, visualize=True, train=False)
         num_workers = opt.num_workers
         if num_workers is None:
-            num_workers = 0 if pose_correction.endswith("stable") else 4
+            # When pose correction loads a large stage1 cache JSON, multi-worker
+            # DataLoader will fork/copy the dict into each worker and can easily
+            # OOM. Default to 0 workers for correction modes unless explicitly
+            # overridden.
+            num_workers = 0 if pose_correction != "none" else 4
+            if pose_correction.endswith("stable"):
+                num_workers = 0
 
         for pos_std, rot_std in noise_pairs:
             # setting noise

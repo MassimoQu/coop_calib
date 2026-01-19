@@ -23,7 +23,13 @@ def load_camera_data(camera_files, preload=True):
     """
     camera_data_list = []
     for camera_file in camera_files:
-        camera_data = Image.open(camera_file)
+        # OPV2V depth maps can be stored as float32 .npy (meters). Keep them as
+        # PIL "F" images so downstream augmentations work without lossy casting.
+        if camera_file.endswith(".npy"):
+            depth_arr = np.load(camera_file)
+            camera_data = Image.fromarray(depth_arr.astype(np.float32))
+        else:
+            camera_data = Image.open(camera_file)
         if preload:
             camera_data = camera_data.copy()
         camera_data_list.append(camera_data)

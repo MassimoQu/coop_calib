@@ -4,6 +4,7 @@ import statistics
 import glob
 import warnings
 import yaml
+import sys
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from tensorboardX import SummaryWriter
@@ -12,6 +13,7 @@ import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools import train_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import multi_gpu_utils
+from opencood.utils import model_utils
 from icecream import ic
 import tqdm
 
@@ -118,6 +120,32 @@ def main():
     model = train_utils.create_model(hypes)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Optional freezing logic for fine-tuning. This is useful when swapping
+    # positional encodings (e.g., ProPE/VRoPE) to adapt the fusion transformer
+    # without destabilizing the whole perception stack.
+    train_cfg = hypes.get("train_params", {}) if isinstance(hypes, dict) else {}
+    trainable_modules = train_cfg.get("trainable_modules", None)
+    freeze_modules = train_cfg.get("freeze_modules", None)
+    freeze_bn = bool(train_cfg.get("freeze_bn", False))
+
+    def _matches_prefix(name: str, prefixes) -> bool:
+        return any(name == p or name.startswith(p + ".") for p in prefixes)
+
+    if trainable_modules:
+        # Freeze everything, then unfreeze the requested module prefixes.
+        print(f"[train_ddp] trainable_modules={trainable_modules} (freezing all others)")
+        for n, p in model.named_parameters():
+            p.requires_grad = _matches_prefix(n, trainable_modules)
+    elif freeze_modules:
+        print(f"[train_ddp] freeze_modules={freeze_modules}")
+        for n, p in model.named_parameters():
+            if _matches_prefix(n, freeze_modules):
+                p.requires_grad = False
+
+    if freeze_bn:
+        print("[train_ddp] freeze_bn=True (setting BatchNorm layers to eval mode)")
+        model.apply(model_utils.fix_bn)
+
     # record lowest validation loss checkpoint.
     lowest_val_loss = 1e5
     lowest_val_epoch = -1
@@ -201,6 +229,10 @@ def main():
             sampler_train.set_epoch(epoch)
         # the model will be evaluation mode during validation
         model.train()
+        # model.train() toggles BN layers back to train mode, so re-freeze them
+        # for fine-tuning runs that request it.
+        if freeze_bn:
+            model.apply(model_utils.fix_bn)
         try: # heter_model stage2
             model_without_ddp.model_train_init()
         except:
@@ -243,7 +275,12 @@ def main():
 
 
         # torch.cuda.empty_cache() # it will destroy memory buffer
-        if epoch % hypes['train_params']['save_freq'] == 0:
+        #
+        # Save checkpoints periodically and always save the final epoch. The original
+        # OpenCOOD logic saves on `epoch % save_freq == 0` with filenames `net_epoch{epoch+1}.pth`,
+        # which can miss the last epoch when `epoches` is an even number and `save_freq=2`.
+        save_freq = int(hypes['train_params'].get('save_freq', 1) or 1)
+        if (epoch % save_freq == 0) or (epoch == int(hypes['train_params']['epoches']) - 1):
             torch.save(model_without_ddp.state_dict(),
                        os.path.join(saved_path,
                                     'net_epoch%d.pth' % (epoch + 1)))
@@ -309,7 +346,9 @@ def main():
 
         if run_test:
             fusion_method = opt.fusion_method
-            cmd = f"python opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"
+            # Use the same interpreter used to launch training. This avoids
+            # accidentally calling system `python` (e.g., Python 2) inside Slurm jobs.
+            cmd = f"{sys.executable} opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"
             print(f"Running command: {cmd}")
             os.system(cmd)
 

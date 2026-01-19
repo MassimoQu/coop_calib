@@ -242,7 +242,13 @@ class HeterModelBaseline(nn.Module):
 
         we omit self.backbone's first layer.
         """
-        fused_feature = self.fusion_net(heter_feature_2d, record_len, affine_matrix)
+        if self.fusion_method == "v2xvit":
+            fused_feature = self.fusion_net(heter_feature_2d,
+                                            record_len,
+                                            affine_matrix,
+                                            data_dict.get("pairwise_t_matrix"))
+        else:
+            fused_feature = self.fusion_net(heter_feature_2d, record_len, affine_matrix)
 
         if self.shrink_flag:
             fused_feature = self.shrink_conv(fused_feature)

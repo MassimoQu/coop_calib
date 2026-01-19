@@ -38,7 +38,6 @@ heter:
       sensor_type: &sensor_type_m1 'lidar'
       core_method: &core_method_m1 "point_pillar"
 
-      # lidar requires preprocess
       preprocess:
         core_method: 'SpVoxelPreprocessor'
         args:
@@ -69,42 +68,45 @@ data_augment:
 preprocess:
   core_method: 'SpVoxelPreprocessor'
   args:
-    voxel_size: [0.4, 0.4, 4] # useful
-    max_points_per_voxel: 1 # useless
-    max_voxel_train: 1 # useless
-    max_voxel_test: 1 # useless
+    voxel_size: [0.4, 0.4, 4]
+    max_points_per_voxel: 1
+    max_voxel_train: 1
+    max_voxel_test: 1
   cav_lidar_range: *cav_lidar
 
 postprocess:
   core_method: 'VoxelPostprocessor'
   gt_range: *cav_lidar
-  max_num: 150
-  order: 'hwl'
   anchor_args:
     cav_lidar_range: *cav_lidar
     l: 3.9
     w: 1.6
     h: 1.56
-    r: [0, 90]
+    r: &anchor_yaw [0, 90]
+    feature_stride: 4
     num: &anchor_num 2
-    feature_stride: 2
   target_args:
     pos_threshold: 0.6
     neg_threshold: 0.45
     score_threshold: 0.2
+  order: 'hwl'
+  max_num: 150
+  nms_thresh: 0.15
+  dir_args: &dir_args
+    dir_offset: 0.7853
+    num_bins: 2
+    anchor_yaw: *anchor_yaw
 
 model:
-  core_method: intermediateheter
+  core_method: heter_model_baseline
   args:
     ego_modality: *ego_modality
     lidar_range: *cav_lidar
-    anchor_number: *anchor_num
-    fusion_method: pastat
-    in_head: 256
 
     m1:
-      core_method: point_pillar
+      core_method: *core_method_m1
       sensor_type: *sensor_type_m1
+
       encoder_args:
         voxel_size: *voxel_size
         lidar_range: *cav_lidar
@@ -124,11 +126,13 @@ model:
         num_upsample_filter: [128, 128, 128]
 
       shrink_header:
-        input_dim: 384
-        kernal_size: [3]
-        dim: [256]
-        stride: [2]
-        padding: [1]
+        kernal_size: [ 3 ]
+        stride: [ 2 ]
+        padding: [ 1 ]
+        dim: [ 256 ]
+        input_dim: 384 # 128 * 3
+
+    fusion_method: pastat
 
     pastat:
       use_pose_confidence: true
@@ -142,52 +146,63 @@ model:
         rot_limit_deg: 10.0
       transformer:
         encoder:
+          # number of fusion blocks per encoder layer
           num_blocks: 1
+          # number of encoder layers
           depth: 3
+          use_roi_mask: true
+          use_RTE: &use_RTE false
+          RTE_ratio: &RTE_ratio 0 # 2 means the dt has 100ms interval while 1 means 50 ms interval
+          # agent-wise attention
           cav_att_config:
             dim: 256
+            use_hetero: true
+            use_RTE: *use_RTE
+            RTE_ratio: *RTE_ratio
             heads: 8
             dim_head: 32
             dropout: 0.3
-            use_RTE: false
-            RTE_ratio: 0
-            use_hetero: true
+          # spatial-wise attention
           pwindow_att_config:
             dim: 256
             heads: [16, 8, 4]
             dim_head: [16, 32, 64]
             dropout: 0.3
-            fusion_method: split_attn
+            window_size: [4, 8, 16]
+            relative_pos_embedding: true
+            fusion_method: 'split_attn'
+          # feedforward condition
           feed_forward:
             mlp_dim: 256
             dropout: 0.3
-          RTE_ratio: 0
+          sttf:
+            voxel_size: *voxel_size
+            downsample_rate: 4
+
+    in_head: 256
+    anchor_number: *anchor_num
+    dir_args: *dir_args
 
 loss:
   core_method: point_pillar_depth_loss
   args:
+    pos_cls_weight: 2.0
     cls:
-      type: SigmoidFocalLoss
+      type: 'SigmoidFocalLoss'
       alpha: 0.25
       gamma: 2.0
       weight: 1.0
     reg:
-      type: WeightedSmoothL1Loss
+      type: 'WeightedSmoothL1Loss'
       sigma: 3.0
-      weight: 2.0
       codewise: true
+      weight: 2.0
     dir:
-      type: WeightedSoftmaxClassificationLoss
-      args:
-        num_bins: 2
-        dir_offset: 0.7853
-        anchor_yaw: [0, 90]
+      type: 'WeightedSoftmaxClassificationLoss'
       weight: 0.2
-    iou:
-      weight: 0.0
+      args: *dir_args
     depth:
       weight: 1.0
-    pos_cls_weight: 2.0
 
 optimizer:
   core_method: Adam
@@ -200,4 +215,3 @@ lr_scheduler:
   core_method: multistep
   gamma: 0.1
   step_size: [15, 50]
-

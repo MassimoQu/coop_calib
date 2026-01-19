@@ -232,7 +232,12 @@ def getLateFusionDataset(cls):
 
                     img_src[0] = normalize_img(img_src[0])
                     if self.load_depth_file:
-                        img_src[1] = img_to_tensor(img_src[1]) * 255
+                        depth_img = img_src[1]
+                        depth_t = img_to_tensor(depth_img)
+                        # Depth from .npy is loaded as PIL "F" (meters) and should not be rescaled.
+                        if getattr(depth_img, "mode", None) != "F":
+                            depth_t = depth_t * 255
+                        img_src[1] = depth_t
 
                     imgs.append(torch.cat(img_src, dim=0))
                     intrins.append(intrin)

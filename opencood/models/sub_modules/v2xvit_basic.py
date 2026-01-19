@@ -89,15 +89,20 @@ class V2XFusionBlock(nn.Module):
         self.num_blocks = num_blocks
 
         for _ in range(num_blocks):
-            att = HGTCavAttention(cav_att_config['dim'],
-                                  heads=cav_att_config['heads'],
-                                  dim_head=cav_att_config['dim_head'],
-                                  dropout=cav_att_config['dropout']) if \
-                cav_att_config['use_hetero'] else \
-                CavAttention(cav_att_config['dim'],
-                             heads=cav_att_config['heads'],
-                             dim_head=cav_att_config['dim_head'],
-                             dropout=cav_att_config['dropout'])
+            pose_pe_cfg = cav_att_config.get("pose_pe", None)
+            att = HGTCavAttention(
+                cav_att_config['dim'],
+                heads=cav_att_config['heads'],
+                dim_head=cav_att_config['dim_head'],
+                dropout=cav_att_config['dropout'],
+                pose_pe=pose_pe_cfg,
+            ) if cav_att_config['use_hetero'] else CavAttention(
+                cav_att_config['dim'],
+                heads=cav_att_config['heads'],
+                dim_head=cav_att_config['dim_head'],
+                dropout=cav_att_config['dropout'],
+                pose_pe=pose_pe_cfg,
+            )
             self.layers.append(
                 nn.ModuleList(
                     [
@@ -119,9 +124,9 @@ class V2XFusionBlock(nn.Module):
                 )
             )
 
-    def forward(self, x, mask, prior_encoding):
+    def forward(self, x, mask, prior_encoding, pairwise_t_matrix=None):
         for cav_attn, pwindow_attn in self.layers:
-            x = cav_attn(x, mask=mask, prior_encoding=prior_encoding) + x
+            x = cav_attn(x, mask=mask, prior_encoding=prior_encoding, pairwise_t_matrix=pairwise_t_matrix) + x
             x = pwindow_attn(x) + x
         return x
 
@@ -159,7 +164,7 @@ class V2XTEncoder(nn.Module):
                                     dropout=dropout))
             ]))
 
-    def forward(self, x, mask, spatial_correction_matrix):
+    def forward(self, x, mask, spatial_correction_matrix, pairwise_t_matrix=None):
 
         # transform the features to the current timestamp
         # velocity, time_delay, infra
@@ -179,7 +184,7 @@ class V2XTEncoder(nn.Module):
                                                                   self.discrete_ratio,
                                                                   self.downsample_rate)
         for attn, ff in self.layers:
-            x = attn(x, mask=com_mask, prior_encoding=prior_encoding)
+            x = attn(x, mask=com_mask, prior_encoding=prior_encoding, pairwise_t_matrix=pairwise_t_matrix)
             x = ff(x) + x
         return x
 
@@ -191,7 +196,7 @@ class V2XTransformer(nn.Module):
         encoder_args = args['encoder']
         self.encoder = V2XTEncoder(encoder_args)
 
-    def forward(self, x, mask, spatial_correction_matrix):
-        output = self.encoder(x, mask, spatial_correction_matrix)
+    def forward(self, x, mask, spatial_correction_matrix, pairwise_t_matrix=None):
+        output = self.encoder(x, mask, spatial_correction_matrix, pairwise_t_matrix=pairwise_t_matrix)
         output = output[:, 0]
         return output

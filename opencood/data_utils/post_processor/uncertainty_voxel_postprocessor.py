@@ -101,11 +101,46 @@ class UncertaintyVoxelPostprocessor(VoxelPostprocessor):
             cur_uncertainty = uncertainty[cur_idx: cur_idx+n]
             if self.params.get('order') == 'hwl':
                 cur_boxes = cur_boxes[:, [0, 1, 2, 5, 4, 3, 6]]
-            # nms
-            keep_index = box_utils.nms_rotated(cur_corners,
-                                               cur_scores,
-                                               self.params['nms_thresh']
-                                               )
+            # Stage-1 export is often used for pose estimation, where we only need a
+            # moderately-sized set of high-confidence boxes. Rotated IoU NMS based
+            # on shapely can become a major bottleneck when the score threshold is
+            # low, so optionally pre-filter to top-K before NMS (and optionally use
+            # axis-aligned NMS).
+            stage1_topk = int(self.params.get('stage1_nms_topk', 0) or 0)
+            if stage1_topk > 0 and cur_scores.numel() > stage1_topk:
+                top_scores, top_idx = torch.topk(cur_scores, k=stage1_topk)
+                cur_corners = cur_corners[top_idx]
+                cur_boxes = cur_boxes[top_idx]
+                cur_uncertainty = cur_uncertainty[top_idx]
+                cur_scores = top_scores
+
+            stage1_nms_type = str(self.params.get('stage1_nms_type', 'rotated') or 'rotated').lower().strip()
+            if stage1_nms_type in {'none', 'off', 'disable', 'disabled'}:
+                keep_index = torch.arange(cur_scores.shape[0], device=cur_scores.device)
+            elif stage1_nms_type in {'axis', 'aabb', 'standup', '2d'}:
+                projected_boxes2d = box_utils.corner_to_standup_box_torch(cur_corners)
+                pred_box2d_score_tensor = torch.cat((projected_boxes2d, cur_scores.unsqueeze(1)), dim=1)
+                keep_index = box_utils.nms_pytorch(pred_box2d_score_tensor, self.params['nms_thresh'])
+            else:
+                keep_index = box_utils.nms_rotated(cur_corners,
+                                                   cur_scores,
+                                                   self.params['nms_thresh']
+                                                   )
+
+            # Optional: cap the number of exported boxes per agent to keep stage1
+            # caches compact (pose correction typically uses only top boxes).
+            stage1_keep_topk = int(self.params.get('stage1_keep_topk', 0) or 0)
+            if stage1_keep_topk > 0:
+                if torch.is_tensor(keep_index):
+                    keep_list = keep_index.detach().cpu().numpy().tolist()
+                else:
+                    keep_list = list(keep_index)
+                if len(keep_list) > stage1_keep_topk:
+                    keep_scores = cur_scores[keep_list]
+                    _, ord_idx = torch.topk(keep_scores, k=stage1_keep_topk)
+                    ord_idx = ord_idx.detach().cpu().numpy().tolist()
+                    keep_list = [keep_list[j] for j in ord_idx]
+                    keep_index = keep_list
             batch_pred_corners3d.append(cur_corners[keep_index])
             batch_pred_boxes3d.append(cur_boxes[keep_index])
             batch_scores.append(cur_scores[keep_index])

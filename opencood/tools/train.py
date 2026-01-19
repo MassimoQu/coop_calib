@@ -6,6 +6,7 @@ import argparse
 import os
 import statistics
 import warnings
+import sys
 
 import yaml
 import torch
@@ -243,7 +244,8 @@ def main():
     run_test = not bool(opt.no_test)
     if run_test:
         fusion_method = opt.fusion_method
-        cmd = f"python opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"
+        # Use the current interpreter (conda env) instead of system `python`.
+        cmd = f"{sys.executable} opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"
         print(f"Running command: {cmd}")
         os.system(cmd)
 

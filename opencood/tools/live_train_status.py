@@ -109,10 +109,13 @@ def _gpu_snapshot() -> Optional[str]:
     """
     Returns a compact nvidia-smi snapshot string, or None if unavailable.
     """
+    # Some clusters wrap `nvidia-smi` to enforce Slurm usage. Prefer the real binary
+    # if it exists so we can still monitor GPU util/memory.
+    smi_bin = "/usr/bin/nvidia-smi" if os.path.exists("/usr/bin/nvidia-smi") else "nvidia-smi"
     try:
         out = subprocess.check_output(
             [
-                "nvidia-smi",
+                smi_bin,
                 "--query-gpu=index,utilization.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
             ],
@@ -188,4 +191,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

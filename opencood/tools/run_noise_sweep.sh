@@ -21,8 +21,9 @@ ROT_STD_LIST="${ROT_STD_LIST:-0,1,2,3,4}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LOG_INTERVAL="${LOG_INTERVAL:-200}"
 
-GPU_ALL="${GPU_ALL:-0}"
-GPU_NONEGO="${GPU_NONEGO:-1}"
+# Default to GPU 4/5 on this server (0-3 are often occupied); override via env if needed.
+GPU_ALL="${GPU_ALL:-4}"
+GPU_NONEGO="${GPU_NONEGO:-5}"
 NOTE_PREFIX="${NOTE_PREFIX:-_final}"
 
 MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-}"
@@ -84,4 +85,3 @@ echo "  ${LOG_NONEGO}"
 echo "[run_noise_sweep] Result YAMLs will be named like:"
 echo "  ${MODEL_DIR}/AP030507_none${NOTE_PREFIX}_all.yaml"
 echo "  ${MODEL_DIR}/AP030507_none${NOTE_PREFIX}_nonego.yaml"
-

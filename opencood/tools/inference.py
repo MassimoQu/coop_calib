@@ -35,6 +35,12 @@ def test_parser():
     parser.add_argument('--save_npy', action='store_true',
                         help='whether to save prediction and gt result'
                              'in npy file')
+    parser.add_argument(
+        '--num_workers',
+        type=int,
+        default=4,
+        help='DataLoader workers (set to 0 if you hit worker deadlocks).',
+    )
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Limit number of samples for quick evaluation')
     parser.add_argument('--range', type=str, default="102.4,102.4",
@@ -123,7 +129,7 @@ def main():
 
     data_loader = DataLoader(dataset_for_loader,
                             batch_size=1,
-                            num_workers=4,
+                            num_workers=int(opt.num_workers),
                             collate_fn=opencood_dataset.collate_batch_test,
                             shuffle=False,
                             pin_memory=False,
@@ -133,6 +139,8 @@ def main():
     result_stat = {0.3: {'tp': [], 'fp': [], 'gt': 0, 'score': []},                
                 0.5: {'tp': [], 'fp': [], 'gt': 0, 'score': []},                
                 0.7: {'tp': [], 'fp': [], 'gt': 0, 'score': []}}
+
+    pose_timing = {}
 
     
     infer_info = opt.fusion_method + opt.note
@@ -150,6 +158,22 @@ def main():
             continue
         with torch.no_grad():
             batch_data = train_utils.to_device(batch_data, device)
+            timing_payload = batch_data.get('ego', {}).get('pose_timing')
+            if timing_payload:
+                def _ingest(payload):
+                    if isinstance(payload, list):
+                        for item in payload:
+                            _ingest(item)
+                        return
+                    if not isinstance(payload, dict):
+                        return
+                    for key, val in payload.items():
+                        if not isinstance(val, (int, float)):
+                            continue
+                        if not str(key).endswith("_sec"):
+                            continue
+                        pose_timing.setdefault(str(key), []).append(float(val))
+                _ingest(timing_payload)
 
             if opt.fusion_method == 'late':
                 infer_result = inference_utils.inference_late_fusion(batch_data,
@@ -241,6 +265,16 @@ def main():
                                     method='bev',
                                     left_hand=left_hand)
         torch.cuda.empty_cache()
+
+    if pose_timing:
+        for key, values in pose_timing.items():
+            arr = np.asarray(values, dtype=np.float64)
+            if arr.size == 0:
+                continue
+            print(
+                f"[pose-timing] {key}: count={int(arr.size)} mean={arr.mean():.6f}s "
+                f"median={np.median(arr):.6f}s p90={np.percentile(arr, 90):.6f}s p95={np.percentile(arr, 95):.6f}s"
+            )
 
     _, ap50, ap70 = eval_utils.eval_final_results(result_stat,
                                 opt.model_dir, infer_info)

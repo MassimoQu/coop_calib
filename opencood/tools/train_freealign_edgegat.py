@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from opencood.extrinsics.path_utils import resolve_repo_path
-from opencood.pose.freealign_paper import EdgeGATLite, FreeAlignPaperConfig
+from opencood.pose.freealign_paper import EdgeGAT, EdgeGATLite, FreeAlignPaperConfig
 from opencood.utils.common_utils import compute_iou, convert_format
 
 
@@ -330,6 +330,9 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--hidden_dim", type=int, default=64)
     ap.add_argument("--out_dim", type=int, default=16)
+    ap.add_argument("--gnn_type", type=str, default="lite", choices=["lite", "egat"])
+    ap.add_argument("--gnn_heads", type=int, default=4)
+    ap.add_argument("--gnn_dropout", type=float, default=0.0)
     ap.add_argument("--max_boxes", type=int, default=60)
     ap.add_argument("--max_samples", type=int, default=None, help="Optional cap on samples per epoch (for quick runs).")
     ap.add_argument("--max_match_dist", type=float, default=3.0, help="Max center distance (m) to accept a GT node match.")
@@ -361,7 +364,16 @@ def main() -> None:
     rng.shuffle(samples)
 
     device = torch.device(str(args.device))
-    net = EdgeGATLite(hidden_dim=int(args.hidden_dim), out_dim=int(args.out_dim)).to(device)
+    gnn_type = str(args.gnn_type or "lite").lower().strip()
+    if gnn_type == "egat":
+        net = EdgeGAT(
+            hidden_dim=int(args.hidden_dim),
+            out_dim=int(args.out_dim),
+            num_heads=int(args.gnn_heads),
+            dropout=float(args.gnn_dropout),
+        ).to(device)
+    else:
+        net = EdgeGATLite(hidden_dim=int(args.hidden_dim), out_dim=int(args.out_dim)).to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=float(args.lr))
 
     cfg = FreeAlignPaperConfig(
@@ -370,6 +382,9 @@ def main() -> None:
         hidden_dim=int(args.hidden_dim),
         out_dim=int(args.out_dim),
         use_gnn=True,
+        gnn_type=str(args.gnn_type or "lite"),
+        gnn_heads=int(args.gnn_heads),
+        gnn_dropout=float(args.gnn_dropout),
         max_boxes=int(args.max_boxes),
     )
     print("[freealign-train] config:", json.dumps(asdict(cfg), indent=2))

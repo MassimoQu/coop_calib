@@ -35,6 +35,8 @@ def train_parser():
                         help="Optional override for stage1 box export directory.")
     parser.add_argument("--splits", type=str, default="train,val,test",
                         help="Comma separated dataset splits to export (default: train,val,test).")
+    parser.add_argument("--train_eval_mode", action='store_true',
+                        help="Build the train split dataset in eval mode (train=False) to reuse collate_batch_test.")
     parser.add_argument("--test_dir_override", type=str, default=None,
                         help="Optional override for hypes['test_dir'] (useful for exporting custom frame lists).")
     parser.add_argument("--comm_range_override", type=float, default=None,
@@ -487,7 +489,7 @@ def _load_state_dict_with_spconv_fix(checkpoint_path):
     return state_dict
 
 
-def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=None, bev_feature_cfg=None):
+def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=None, bev_feature_cfg=None, train_eval_mode=False):
     feature_cfg = feature_cfg or {}
     bev_feature_cfg = bev_feature_cfg or {}
     feature_topk = max(0, int(feature_cfg.get('topk', 0)))
@@ -518,7 +520,12 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
         hypes.update({"noise_setting": noise_setting})
 
         print('Dataset Building')
-        opencood_train_dataset = build_dataset(hypes, visualize=False, train=True)
+        if train_eval_mode:
+            hypes_train = copy.deepcopy(hypes)
+            hypes_train['validate_dir'] = hypes_train['root_dir']
+            opencood_train_dataset = build_dataset(hypes_train, visualize=False, train=False)
+        else:
+            opencood_train_dataset = build_dataset(hypes, visualize=False, train=True)
         opencood_validate_dataset = build_dataset(hypes, visualize=False, train=False)
         hypes_ = copy.deepcopy(hypes)
         hypes_['validate_dir'] = hypes_['test_dir']
@@ -899,6 +906,7 @@ def run_per_agent_mode(opt, feature_cfg, bev_feature_cfg):
             feature_cfg=feature_cfg,
             max_samples=opt.max_export_samples,
             bev_feature_cfg=bev_feature_cfg,
+            train_eval_mode=opt.train_eval_mode,
         )
 
     veh_stage1_path = exported_paths['vehicle'].get(target_split)
@@ -961,6 +969,7 @@ def main():
         feature_cfg=feature_cfg,
         max_samples=opt.max_export_samples,
         bev_feature_cfg=bev_feature_cfg,
+        train_eval_mode=opt.train_eval_mode,
     )
 
 

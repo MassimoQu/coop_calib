@@ -17,6 +17,8 @@ from opencood.data_utils.augmentor.data_augmentor import DataAugmentor
 from opencood.hypes_yaml.yaml_utils import load_yaml
 from opencood.utils.camera_utils import load_camera_data
 from opencood.utils.transformation_utils import x1_to_x2
+from opencood.utils.transformation_utils import x_to_world
+from opencood.utils.transformation_utils import tfm_to_pose
 from opencood.data_utils.pre_processor import build_preprocessor
 from opencood.data_utils.post_processor import build_postprocessor
 
@@ -147,9 +149,7 @@ class OPV2VBaseDataset(Dataset):
                                               timestamp + '.pcd')
                     camera_files = self.find_camera_files(cav_path, 
                                                 timestamp)
-                    depth_files = self.find_camera_files(cav_path, 
-                                                timestamp, sensor="depth")
-                    depth_files = [depth_file.replace("OPV2V", "OPV2V_Hetero") for depth_file in depth_files]
+                    depth_files = self.find_depth_files(cav_path, timestamp)
 
                     self.scenario_database[i][cav_id][timestamp]['yaml'] = \
                         yaml_file
@@ -239,6 +239,97 @@ class OPV2VBaseDataset(Dataset):
                 data[cav_id]['params'] = \
                     load_yaml(cav_content[timestamp_key]['yaml'])
 
+            # V2V4Real stores poses as 4x4 transformation matrices in yaml. The rest of the
+            # OpenCOOD pipeline expects 6-DoF pose vectors [x,y,z,roll,yaw,pitch] in degrees.
+            #
+            # NOTE: V2V4Real object labels are in the *local LiDAR frame* (KITTI-style),
+            # while OPV2V labels are typically in a global/world frame. When we detect a
+            # 4x4 lidar_pose (V2V4Real), convert vehicle labels to world coordinates so the
+            # existing OpenCOOD box projection code (world -> ego) works as intended.
+            params = data[cav_id].get("params") or {}
+            if isinstance(params, dict) and "lidar_pose" in params:
+                pose = params.get("lidar_pose")
+                pose_tfm = None
+                try:
+                    pose_arr = np.asarray(pose, dtype=np.float32)
+                except Exception:
+                    pose_arr = None
+                if pose_arr is not None:
+                    if pose_arr.shape == (4, 4):
+                        pose_tfm = pose_arr
+                        params["lidar_pose"] = np.asarray(tfm_to_pose(pose_arr), dtype=np.float32)
+                    elif pose_arr.shape == (6,):
+                        params["lidar_pose"] = pose_arr
+                    elif pose_arr.shape == (3,):
+                        full = np.zeros((6,), dtype=np.float32)
+                        full[[0, 1, 4]] = pose_arr
+                        params["lidar_pose"] = full
+
+                # Convert per-frame vehicle labels from LiDAR-local to world when needed.
+                #
+                # V2V4Real uses KITTI-style labels in the *local LiDAR frame* while providing a
+                # 4x4 `lidar_pose` transformation. OpenCOOD's downstream projection expects
+                # world-frame objects, so we need to lift them to world coordinates.
+                #
+                # Some scenarios have small global translations (near the origin), where a
+                # naive heuristic may fail. Allow dataset-specific override via
+                # `force_vehicle_local_to_world` (set by V2V4REALBaseDataset).
+                if pose_tfm is not None and isinstance(params.get("vehicles"), dict):
+                    vehicles = params.get("vehicles") or {}
+                    force_local_to_world = bool(getattr(self, "force_vehicle_local_to_world", False))
+                    # Heuristic: if objects are near the origin while lidar pose is far from it,
+                    # the labels are likely in the local LiDAR frame.
+                    trans_norm = float(np.linalg.norm(np.asarray(pose_tfm[:2, 3], dtype=np.float32)))
+                    local_like = False
+                    if force_local_to_world:
+                        local_like = True
+                    else:
+                        for v in vehicles.values():
+                            loc = np.asarray((v or {}).get("location", [0, 0, 0]), dtype=np.float32)
+                            if float(np.linalg.norm(loc[:2])) < 200.0 and trans_norm > 200.0:
+                                local_like = True
+                                break
+                    if local_like and vehicles:
+                        Tw_lidar = np.asarray(pose_tfm, dtype=np.float32)
+                        vehicles_world = {}
+                        for obj_id, obj in vehicles.items():
+                            try:
+                                obj = obj or {}
+                                loc = np.asarray(obj.get("location", [0, 0, 0]), dtype=np.float32)
+                                center = np.asarray(obj.get("center", [0, 0, 0]), dtype=np.float32)
+                                ang = np.asarray(obj.get("angle", [0, 0, 0]), dtype=np.float32)
+                                obj_pose_local = [
+                                    float(loc[0] + center[0]),
+                                    float(loc[1] + center[1]),
+                                    float(loc[2] + center[2]),
+                                    float(ang[0]),
+                                    float(ang[1]),
+                                    float(ang[2]),
+                                ]
+                                # Treat LiDAR frame as the 'world' to build T_lidar_obj.
+                                T_lidar_obj = x_to_world(obj_pose_local)
+                                T_world_obj = Tw_lidar @ T_lidar_obj
+                                obj_pose_world = tfm_to_pose(T_world_obj)
+
+                                new_obj = dict(obj)
+                                new_obj["location"] = [float(obj_pose_world[0]), float(obj_pose_world[1]), float(obj_pose_world[2])]
+                                new_obj["angle"] = [float(obj_pose_world[3]), float(obj_pose_world[4]), float(obj_pose_world[5])]
+                                # Avoid double-applying 'center' after we've baked it into 'location'.
+                                new_obj["center"] = [0, 0, 0]
+                                vehicles_world[obj_id] = new_obj
+                            except Exception:
+                                vehicles_world[obj_id] = obj
+                        params["vehicles"] = vehicles_world
+            if isinstance(params, dict) and "true_ego_pos" in params:
+                pose = params.get("true_ego_pos")
+                try:
+                    pose_arr = np.asarray(pose, dtype=np.float32)
+                except Exception:
+                    pose_arr = None
+                if pose_arr is not None and pose_arr.shape == (4, 4):
+                    params["true_ego_pos"] = np.asarray(tfm_to_pose(pose_arr), dtype=np.float32)
+            data[cav_id]["params"] = params
+
             # load camera file: hdf5 is faster than png
             hdf5_file = cav_content[timestamp_key]['cameras'][0].replace("camera0.png", "imgs.hdf5")
 
@@ -274,6 +365,12 @@ class OPV2VBaseDataset(Dataset):
                     cav_content[timestamp_key][file_extension] = cav_content[timestamp_key][file_extension].replace("train","additional/train")
                     cav_content[timestamp_key][file_extension] = cav_content[timestamp_key][file_extension].replace("validate","additional/validate")
                     cav_content[timestamp_key][file_extension] = cav_content[timestamp_key][file_extension].replace("test","additional/test")
+
+                # Some OPV2V releases only provide `additional/train/*` (no test/validate).
+                # Avoid noisy OpenCV warnings and let downstream code handle missing extras.
+                if not os.path.exists(cav_content[timestamp_key][file_extension]):
+                    data[cav_id][file_extension] = None
+                    continue
                     
                 if '.yaml' in file_extension:
                     data[cav_id][file_extension] = \
@@ -375,6 +472,51 @@ class OPV2VBaseDataset(Dataset):
         camera3_file = os.path.join(cav_path,
                                     timestamp + f'_{sensor}3.png')
         return [camera0_file, camera1_file, camera2_file, camera3_file]
+
+    @staticmethod
+    def find_depth_files(cav_path, timestamp):
+        """
+        Depth file naming differs across OPV2V releases.
+
+        This repo historically expects png files named:
+          {timestamp}_depth{0..3}.png (under OPV2V_Hetero)
+
+        The provided depth pack may instead contain npy files named:
+          {timestamp}_camera{0..3}_depth.npy (also under a parallel tree).
+
+        We try multiple patterns and return the first existing path per camera.
+        """
+        # Try depth files under OPV2V_Hetero first, then fall back to the same tree.
+        candidate_dirs = []
+        hetero_dir = cav_path.replace("OPV2V", "OPV2V_Hetero")
+        if hetero_dir != cav_path:
+            candidate_dirs.append(hetero_dir)
+        candidate_dirs.append(cav_path)
+
+        patterns = [
+            lambda i: f"{timestamp}_depth{i}.png",
+            lambda i: f"{timestamp}_depth{i}.npy",
+            lambda i: f"{timestamp}_camera{i}_depth.npy",
+            lambda i: f"{timestamp}_camera{i}_depth.png",
+        ]
+
+        depth_files = []
+        for i in range(4):
+            chosen = None
+            for d in candidate_dirs:
+                for pat in patterns:
+                    cand = os.path.join(d, pat(i))
+                    if os.path.exists(cand):
+                        chosen = cand
+                        break
+                if chosen is not None:
+                    break
+            # Keep a deterministic path for clearer error messages later.
+            if chosen is None:
+                chosen = os.path.join(candidate_dirs[0], f"{timestamp}_depth{i}.png")
+            depth_files.append(chosen)
+
+        return depth_files
 
 
     def augment(self, lidar_np, object_bbx_center, object_bbx_mask):
