@@ -1,0 +1,14 @@
+{
+  "dataset": "v2v4real",
+  "data_dir": "/data2/v2v4real",
+  "counts": {
+    "train": 32,
+    "val": 3,
+    "test": 9
+  },
+  "overlap_train_test": [
+    "testoutput_CAV_data_2022-03-15-09-54-40_0"
+  ],
+  "dedup": true,
+  "dedup_keep": "test"
+}

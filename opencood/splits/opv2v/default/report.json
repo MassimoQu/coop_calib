@@ -1,0 +1,12 @@
+{
+  "dataset": "opv2v",
+  "data_dir": "/data2/OPV2V",
+  "counts": {
+    "train": 43,
+    "val": 9,
+    "test": 16
+  },
+  "overlap_train_test": [],
+  "dedup": false,
+  "dedup_keep": "test"
+}

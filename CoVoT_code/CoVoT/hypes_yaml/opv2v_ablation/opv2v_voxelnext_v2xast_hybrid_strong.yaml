@@ -1,0 +1,129 @@
+name: opv2v_voxelnext_v2xast_hybrid_strong
+root_dir: "/home/qqxluca/v2xreg_private/HEAL/dataset/OPV2V/train"
+validate_dir: "/home/qqxluca/v2xreg_private/HEAL/dataset/OPV2V/validate"
+
+yaml_parser: "load_second_params"
+train_params:
+  batch_size: &batch_size 2
+  epoches: 40
+  eval_freq: 1
+  save_freq: 1
+
+fusion:
+  core_method: "HybridFusionDataset"
+  args: []
+
+# preprocess-related
+preprocess:
+  core_method: "SpVoxelPreprocessor"
+  args:
+    voxel_size: &voxel_size [0.1, 0.1, 0.1]
+    max_points_per_voxel: 4
+    max_voxel_train: 60000
+    max_voxel_test: 100000
+  cav_lidar_range: &cav_lidar [-140.8, -38.4, -3, 140.8, 38.4, 1]
+  grid_size: &grid_size [2816, 768, 40]
+
+data_augment:
+  - NAME: random_world_flip
+    ALONG_AXIS_LIST: ["x"]
+  - NAME: random_world_rotation
+    WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
+  - NAME: random_world_scaling
+    WORLD_SCALE_RANGE: [0.95, 1.05]
+
+# anchor box related
+postprocess:
+  core_method: "VoxelPostprocessor"
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: [0, 90]
+    feature_stride: 8
+    num: &anchor_num 2
+  target_args:
+    pos_threshold: 0.6
+    neg_threshold: 0.45
+    score_threshold: 0.2
+  order: "hwl"
+  max_num: 100
+  nms_thresh: 0.15
+
+# model related
+model:
+  core_method: voxelnext_v2xast_hybrid
+  args:
+    raw: false
+    backbone_fix: true
+    batch_size: *batch_size
+    voxel_size: *voxel_size
+    lidar_range: *cav_lidar
+    anchor_number: *anchor_num
+    anchor_num: *anchor_num
+    grid_size: *grid_size
+    mean_vfe:
+      feature_points: &num_point_features 4
+
+    backbone_3d:
+      input_channels: *num_point_features
+      grid_size: *grid_size
+      spconv_kernel_sizes: [3, 3, 3, 3, 3]
+      channels: [32, 64, 128, 256, 256]
+      out_channel: 256
+      point_cloud_range: *cav_lidar
+
+    base_bev_backbone:
+      layer_nums: [5, 5]
+      layer_strides: [1, 2]
+      num_filters: [128, 256]
+      upsample_strides: [1, 2]
+      num_upsample_filter: [256, 256]
+
+    fusion:
+      d_model: [256, 256]
+      nhead: [8, 8]
+      num_blocks: 2
+      dim_feedforward: [256, 256]
+      output_shape: [96, 352]
+      debug: true
+      encoder:
+        window_shape: [8, 8]
+        sparse_shape: [352, 96, 1]
+        shuffle_voxels: true
+        debug: true
+        pos_temperature: 10000
+        normalize_pos: false
+
+    preprocess:
+      core_method: "SpVoxelPreprocessorGPU"
+      args:
+        voxel_size: *voxel_size
+        max_points_per_voxel: 4
+        max_voxel_train: 60000
+        max_voxel_test: 100000
+      cav_lidar_range: *cav_lidar
+      grid_size: *grid_size
+
+    quant_level: [*voxel_size, [0.1, 0.1, 0.1]]
+    point_cloud_range: *cav_lidar
+    quantize_switch: false
+
+loss:
+  core_method: point_pillar_loss
+  args:
+    cls_weight: 1.0
+    reg: 2.0
+
+optimizer:
+  core_method: AdamW
+  lr: 0.0002
+  args:
+    eps: 1e-10
+    weight_decay: 1e-4
+
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size: [15, 30, 75]

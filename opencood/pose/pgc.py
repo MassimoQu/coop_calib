@@ -175,6 +175,12 @@ class PGCInferConfig:
     ransac_iter: int = 64
     ransac_inlier_th: float = 1.0
     ransac_min_inliers: int = 16
+    # Optional uniform scale applied to XYZ (both input points and the internal
+    # RANSAC/Kabsch correspondence space). This is useful for datasets with large
+    # global coordinates (e.g., GNSS/UTM-like meters in the thousands).
+    #
+    # NOTE: The returned pose is always in the original (unscaled) units.
+    coord_scale: float = 1.0
 
 
 @torch.no_grad()
@@ -190,21 +196,37 @@ def infer_pose_and_confidence(
     """
     cfg = cfg or PGCInferConfig()
     pts = rsd_downsample(points_xyzi, num_points=int(cfg.num_points), voxel_size=float(cfg.rsd_voxel_size))
-    pts_t = torch.from_numpy(pts).unsqueeze(0)
+
+    scale = float(getattr(cfg, "coord_scale", 1.0) or 1.0)
+    if not (scale > 0.0):
+        scale = 1.0
+
+    pts_net = pts.copy()
+    if scale != 1.0:
+        pts_net[:, :3] = pts_net[:, :3] * scale
+
+    pts_t = torch.from_numpy(pts_net).unsqueeze(0)
     if device is not None:
         pts_t = pts_t.to(device)
     y_pred, eps = model(pts_t)
     conf = float(pose_confidence_from_epsilon(eps)[0].detach().cpu().item())
 
-    src = pts[:, :3].astype(np.float64)
+    # Estimate pose in the (optionally) scaled coordinate system.
+    src = pts_net[:, :3].astype(np.float64)
     tgt = y_pred[0].detach().cpu().numpy().astype(np.float64)
     T, meta = ransac_se3(
         src,
         tgt,
         num_iter=int(cfg.ransac_iter),
-        inlier_th=float(cfg.ransac_inlier_th),
+        inlier_th=float(cfg.ransac_inlier_th) * scale,
         min_inliers=int(cfg.ransac_min_inliers),
     )
+
+    # Convert back to original units (meters).
+    if scale != 1.0:
+        T = np.asarray(T, dtype=np.float64).copy()
+        T[:3, 3] = T[:3, 3] / scale
+
     meta = dict(meta)
-    meta.update({"confidence": conf})
+    meta.update({"confidence": conf, "coord_scale": float(scale)})
     return T, conf, meta

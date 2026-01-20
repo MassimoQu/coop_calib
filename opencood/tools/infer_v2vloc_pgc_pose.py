@@ -34,22 +34,31 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ransac_iter", type=int, default=64)
     p.add_argument("--ransac_inlier_th", type=float, default=1.0)
     p.add_argument("--ransac_min_inliers", type=int, default=16)
+    p.add_argument(
+        "--coord_scale",
+        type=float,
+        default=None,
+        help="Optional XYZ scale used during PGC training/inference for numerical conditioning. "
+             "If omitted, try to read from the PGC checkpoint args; otherwise defaults to 1.0.",
+    )
     return p.parse_args()
 
 
-def _load_pgc(ckpt_path: str, device: torch.device) -> PGCNet:
+def _load_pgc(ckpt_path: str, device: torch.device):
     state = torch.load(str(ckpt_path), map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         sd = state["state_dict"]
-        feat_dim = int((state.get("args") or {}).get("feat_dim", 256))
+        ckpt_args = state.get("args") or {}
+        feat_dim = int(ckpt_args.get("feat_dim", 256))
     else:
         sd = state
+        ckpt_args = {}
         feat_dim = 256
     model = PGCNet(in_dim=4, feat_dim=int(feat_dim))
     model.load_state_dict(sd, strict=True)
     model.to(device)
     model.eval()
-    return model
+    return model, ckpt_args
 
 
 def main() -> None:
@@ -70,13 +79,20 @@ def main() -> None:
     ds = build_dataset(hypes, visualize=False, train=train)
     max_samples = int(args.max_samples) if int(args.max_samples) > 0 else len(ds)
 
-    model = _load_pgc(args.pgc_ckpt, device)
+    model, ckpt_args = _load_pgc(args.pgc_ckpt, device)
+    coord_scale = args.coord_scale
+    if coord_scale is None:
+        try:
+            coord_scale = float(ckpt_args.get("coord_scale", 1.0))
+        except Exception:
+            coord_scale = 1.0
     cfg = PGCInferConfig(
         num_points=int(args.num_points),
         rsd_voxel_size=float(args.rsd_voxel_size),
         ransac_iter=int(args.ransac_iter),
         ransac_inlier_th=float(args.ransac_inlier_th),
         ransac_min_inliers=int(args.ransac_min_inliers),
+        coord_scale=float(coord_scale) if coord_scale is not None else 1.0,
     )
 
     out: Dict[str, Dict[str, object]] = {}

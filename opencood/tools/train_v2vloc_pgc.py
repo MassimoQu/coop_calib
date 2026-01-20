@@ -41,8 +41,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--num_points", type=int, default=4096)
     p.add_argument("--rsd_voxel_size", type=float, default=0.2)
     p.add_argument("--feat_dim", type=int, default=256)
+    p.add_argument(
+        "--coord_scale",
+        type=float,
+        default=1.0,
+        help="Optional uniform scale applied to XYZ (both input points and pose translations) to improve conditioning on datasets "
+             "with large global coordinates. 1.0 keeps original units (meters).",
+    )
 
     p.add_argument("--log_every", type=int, default=50)
+    p.add_argument(
+        "--save_every",
+        type=int,
+        default=0,
+        help="Save intermediate checkpoints every N epochs (0=only save final).",
+    )
     return p.parse_args()
 
 
@@ -132,6 +145,9 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     model.train()
+    coord_scale = float(args.coord_scale)
+    if not (coord_scale > 0.0):
+        coord_scale = 1.0
     for epoch in range(int(args.epochs)):
         running = 0.0
         n = 0
@@ -140,10 +156,23 @@ def main() -> None:
             points = points.to(device, non_blocking=True).float()
             pose = pose.to(device, non_blocking=True).float()
 
-            y_gt = _world_coords(points, pose)  # (B,N,3)
-            y_pred, eps_pred = model(points)
+            if coord_scale != 1.0:
+                # Keep downsampling voxel size in meters (done in __getitem__), then
+                # scale coordinates to improve regression conditioning.
+                points_s = points.clone()
+                points_s[..., :3] = points_s[..., :3] * coord_scale
+                pose_s = pose.clone()
+                pose_s[:, :3] = pose_s[:, :3] * coord_scale
+            else:
+                points_s = points
+                pose_s = pose
 
-            u = (y_pred - y_gt).abs().mean(dim=(1, 2))  # (B,)
+            y_gt = _world_coords(points_s, pose_s)  # (B,N,3)
+            y_pred, eps_pred = model(points_s)
+
+            # Paper Eq.(4)(5): use per-sample mean Euclidean distance.
+            diff = y_pred - y_gt
+            u = (diff.pow(2).sum(dim=-1).clamp_min(1e-12).sqrt()).mean(dim=1)  # (B,)
             loss = (u + (u - eps_pred).abs()).mean()
 
             opt.zero_grad()
@@ -157,6 +186,14 @@ def main() -> None:
 
         print(f"[pgc] epoch {epoch+1}/{int(args.epochs)} done: avg_loss={running/max(n,1):.6f}")
 
+        # Optional: intermediate checkpoints for long runs / monitoring.
+        if int(args.save_every) > 0 and (epoch + 1) % int(args.save_every) == 0:
+            out_ckpt = Path(args.out_ckpt)
+            out_ckpt.parent.mkdir(parents=True, exist_ok=True)
+            mid = out_ckpt.with_name(f"{out_ckpt.stem}_epoch{epoch+1}{out_ckpt.suffix}")
+            torch.save({"state_dict": model.state_dict(), "args": vars(args)}, str(mid))
+            print(f"[pgc] saved: {mid}")
+
     out_ckpt = Path(args.out_ckpt)
     out_ckpt.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "args": vars(args)}, str(out_ckpt))
@@ -165,4 +202,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

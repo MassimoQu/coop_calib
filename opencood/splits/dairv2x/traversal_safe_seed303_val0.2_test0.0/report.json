@@ -1,0 +1,45 @@
+{
+  "dataset": "dair",
+  "data_dir": "/data2/DAIR-V2X-C/cooperative-vehicle-infrastructure",
+  "seed": 303,
+  "group_by": "intersection_batch",
+  "val_ratio": 0.2,
+  "test_ratio": 0.0,
+  "min_group_size": 1,
+  "dropped_unknown_intersection": 0,
+  "dropped_missing_infra_meta": 1,
+  "num_records_raw": 6616,
+  "num_records_kept": 6616,
+  "num_groups": 74,
+  "counts": {
+    "train": 5772,
+    "val": 844,
+    "test": 0
+  },
+  "per_intersection_counts": {
+    "yizhuang06": {
+      "train": 1062,
+      "val": 15
+    },
+    "yizhuang08": {
+      "train": 468,
+      "val": 149
+    },
+    "yizhuang09": {
+      "train": 1632,
+      "val": 174
+    },
+    "yizhuang10": {
+      "train": 1283,
+      "val": 286
+    },
+    "yizhuang13": {
+      "train": 348,
+      "val": 144
+    },
+    "yizhuang16": {
+      "train": 979,
+      "val": 76
+    }
+  }
+}

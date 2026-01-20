@@ -73,7 +73,29 @@ class DAIRV2XBaseDataset(Dataset):
         self.root_dir = params['data_dir']
 
         self.split_info = read_json(split_dir)
-        co_datainfo = read_json(os.path.join(self.root_dir, 'cooperative/data_info.json'))
+        data_info_path = params.get('data_info_path')
+        if data_info_path:
+            if not os.path.isabs(str(data_info_path)):
+                candidate = os.path.join(self.root_dir, str(data_info_path))
+                if os.path.exists(candidate):
+                    data_info_path = candidate
+                else:
+                    candidate = os.path.join(self.root_dir, 'cooperative', str(data_info_path))
+                    if os.path.exists(candidate):
+                        data_info_path = candidate
+            if not os.path.isabs(str(data_info_path)):
+                try:
+                    from opencood.extrinsics.path_utils import resolve_repo_path
+
+                    resolved = resolve_repo_path(str(data_info_path))
+                    if resolved.exists():
+                        data_info_path = str(resolved)
+                except Exception:
+                    pass
+        if data_info_path:
+            co_datainfo = read_json(data_info_path)
+        else:
+            co_datainfo = read_json(os.path.join(self.root_dir, 'cooperative/data_info.json'))
         self.co_data = OrderedDict()
         self.co_data_pair = {}
         for frame_info in co_datainfo:

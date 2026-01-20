@@ -306,7 +306,12 @@ class OPV2VBaseDataset(Dataset):
                         self.len_record.append(prev_last + len(timestamps))
                 else:
                     self.scenario_database[i][cav_id]['ego'] = False
-        print("len:", self.len_record[-1])
+        # Some non-invasive scenario filters can legitimately yield an empty split.
+        # Avoid IndexError so callers get a clean 0-length dataset.
+        if self.len_record:
+            print("len:", self.len_record[-1])
+        else:
+            print("len: 0")
 
     def retrieve_base_data(self, idx):
         """
