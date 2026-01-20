@@ -1,7 +1,7 @@
 # HEAL (HEterogeneous ALliance)
 [ICLR2024] HEAL: An Extensible Framework for Open Heterogeneous Collaborative Perception
 
-This repo is also a **unified** and **integrated** multi-agent collaborative perception framework for **LiDAR-based**, **camera-based** and **heterogeneous** setting! 
+This repo is also a **unified** and **integrated** multi-agent collaborative perception framework for **LiDAR-based**, **camera-based** and **heterogeneous** setting!
 > 这个仓库同时是一个**统一**且**高集成**的多智能体协作感知框架，适用于 **纯LiDAR**、**纯Camera**和**异构** 实验设置。
 
 Through powerful code integration, you can access **4 datasets**, **the latest collaborative perception methods**, and **multiple modality** here. This is the most complete collaboration perception framework available.
@@ -12,7 +12,58 @@ Through powerful code integration, you can access **4 datasets**, **the latest c
 
 ![HEAL Teaser](images/teaser5.jpg)
 
-## Repo Feature
+## Current Focus (This Fork)
+
+This fork concentrates on **pose/alignment evaluation**, **dataset hygiene**, and **paper-aligned configs** while keeping the upstream HEAL training stack intact. The sections below summarize what is being tried, the current status, and the gaps.
+
+### Pose Correction / PGC Integration
+Goal: use cached pose predictions (PGC/V2VLoc-style) to study alignment robustness and "stable" filtering.
+Progress: PGC training/inference helpers added, RSD downsampling + RANSAC pose recovery implemented, and a Stage1 PGC pose corrector added for cached pose JSON.
+Results: no consolidated public metrics yet; outputs are JSON pose caches and YAML sweep summaries.
+Limitations: requires pose caches; stable mode needs sequential sampling; parameter sweeps not fully standardized.
+Next: run noise sweeps with `opencood/tools/sbatch_pose_sweep.sh` and compare to no-correction baselines.
+
+### Dataset Hygiene & Scenario Filtering
+Goal: eliminate train/test leakage and make splits reproducible across DAIR/OPV2V/V2V4Real.
+Progress: non-invasive split generator (`opencood/tools/make_dataset_splits.py`) plus pre-generated split files under `opencood/splits/`.
+Results: split JSONs + reports are versioned for DAIR traversal-safe, OPV2V default, and V2V4Real de-dup runs.
+Limitations: split files are opt-in; you must wire them into your YAMLs.
+Next: extend configs to consume split lists by default and document recommended choices.
+
+### V2V4Real Multi-Ego Evaluation
+Goal: match the paper’s evaluation protocol that counts each timestamp from multiple ego views.
+Progress: `V2V4REALBaseDataset` adds multi-ego expansion (configurable via `v2v4real_multi_ego`).
+Results: expanded frame counts match the intended protocol; AP/accuracy numbers not bundled here.
+Limitations: still needs dataset-side verification for each experiment and model.
+Next: run the V2V4Real hypes in `opencood/hypes_yaml/v2v4real/` and log AP curves.
+
+### OPV2V Camera Bench Configs
+Goal: run V2X-ViT camera benchmarks on OPV2V using HEAL’s hetero pipeline.
+Progress: camera-only V2X-ViT configs added under `opencood/hypes_yaml/opv2v/CameraOnly/`.
+Results: not run in this repo; configs are ready.
+Limitations: OPV2V camera “additional” assets are required.
+Next: train/evaluate and record metrics.
+
+### CoVoT Snapshot (Reference Only)
+Goal: keep a frozen copy of CoVoT code for cross-checks and ablation references.
+Progress: `CoVoT_code/` and the associated paper PDF are included.
+Results: not integrated into HEAL pipelines.
+Limitations: separate dependencies; no direct training/inference wiring in this repo.
+Next: decide whether to integrate or keep as a reference-only subtree.
+
+## Major Local Changes (Relative to Upstream HEAL)
+
+- Pose cache tooling and PGC inference: `opencood/tools/train_v2vloc_pgc.py`, `opencood/tools/infer_v2vloc_pgc_pose.py`, `opencood/tools/eval_pgc_pose_json.py`, plus `opencood/pose/pgc.py` RSD + RANSAC.
+- Pose-correction bridge for cached PGC output: `opencood/extrinsics/pose_correction/stage1_pgc_pose.py`.
+- Scenario filtering for OPV2V: `opencood/data_utils/datasets/basedataset/opv2v_basedataset.py` supports `scenario_list` / `scenario_blacklist`.
+- DAIR-V2X data_info overrides + pair disambiguation: `opencood/data_utils/datasets/basedataset/dairv2x_basedataset.py`.
+- V2V4Real multi-ego dataset class + configs: `opencood/data_utils/datasets/basedataset/v2v4real_basedataset.py`, `opencood/hypes_yaml/v2v4real/`.
+- Non-invasive split generator + versioned split lists: `opencood/tools/make_dataset_splits.py`, `opencood/splits/`.
+- Extra evaluation/monitoring helpers: `opencood/tools/plot_pose_sweep.py`, `opencood/tools/quick_eval_watch.py`, `opencood/tools/pgc_quick_eval_watch.py`, `opencood/tools/eval_freealign_temporal_alignment.py`.
+- OPV2V camera V2X-ViT bench configs and LiDAR pastat configs: `opencood/hypes_yaml/opv2v/CameraOnly/`, `opencood/hypes_yaml/opv2v/LiDAROnly/`.
+- CoVoT snapshot under `CoVoT_code/` (not wired into HEAL training).
+
+## HEAL Core Features (Upstream Overview)
 
 - Modality Support
   - [x] LiDAR
