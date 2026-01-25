@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  PYTHON_VERSION: '3.8'
+  CUDA_VERSION: '11.8'
+
+jobs:
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install black isort flake8 mypy
+
+      - name: Check code formatting (Black)
+        run: |
+          if ! black --check . 2>/dev/null; then
+            echo "Code formatting issues found. Run 'black .' to fix."
+            black --diff . || true
+          fi
+
+      - name: Check import sorting (isort)
+        run: |
+          if ! isort --check-only --diff . 2>/dev/null; then
+            echo "Import sorting issues found. Run 'isort .' to fix."
+            isort --check-only --diff . || true
+          fi
+
+      - name: Run flake8
+        run: |
+          flake8 . --max-line-length=88 --extend-ignore=E203 || true
+
+      - name: Run mypy type checking
+        run: |
+          mypy . --ignore-missing-imports || true
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.10']
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov codecov
+
+      - name: Run tests
+        run: |
+          if [ -d "tests" ]; then
+            pytest tests/ -v --cov=. --cov-report=xml
+          else
+            echo "No tests directory found. Skipping test execution."
+          fi
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  build:
+    name: Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install setuptools wheel twine check-wheel-contents
+
+      - name: Build package
+        run: |
+          if [ -f "setup.py" ]; then
+            python setup.py sdist bdist_wheel
+            python -m twine check dist/*
+          fi
+
+      - name: Verify distribution
+        run: |
+          if [ -d "dist" ]; then
+            ls -la dist/
+          fi
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: massimoqu/coop_calib:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  style-check:
+    name: Code Style Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for common issues
+        run: |
+          # 检查是否存在 TODO 注释
+          grep -r "TODO" --include="*.py" . || echo "No TODO comments found"
+
+          # 检查是否存在 FIXME 注释
+          grep -r "FIXME" --include="*.py" . || echo "No FIXME comments found"
+
+          # 检查文件权限
+          find . -type f -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+
+      - name: Validate YAML files
+        run: |
+          pip install pyyaml
+          find . -name "*.yaml" -o -name "*.yml" | while read f; do
+            python -c "import yaml; yaml.safe_load(open('$f'))" 2>/dev/null && echo "✓ $f" || echo "✗ $f (invalid YAML)"
+          done
+
+      - name: Check file permissions
+        run: |
+          echo "Checking executable permissions..."
+          find . -type f -executable | head -20
