@@ -165,3 +165,6 @@ opencood/tools/save_params.py
 .vscode
 opencood/tools/inference_w_noise_heter.py
 opencood/pose/pgc_outputs/
+
+# Reference PDFs (keep out of git; see docs/REFERENCES.md)
+*.pdf
