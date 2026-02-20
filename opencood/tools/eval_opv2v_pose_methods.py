@@ -172,7 +172,7 @@ def main() -> None:
     ap.add_argument("--freealign_device", type=str, default="cpu")
 
     # V2XReg++ knobs.
-    ap.add_argument("--v2xregpp_config", type=str, default="configs/pipeline_detection_pp_ft.yaml")
+    ap.add_argument("--v2xregpp_config", type=str, default="configs/dair/detection/pipeline_detection_pp_ft.yaml")
     ap.add_argument("--v2xregpp_min_matches", type=int, default=3)
     ap.add_argument("--v2xregpp_min_stability", type=float, default=0.0)
 

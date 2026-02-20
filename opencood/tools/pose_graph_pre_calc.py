@@ -489,6 +489,39 @@ def _load_state_dict_with_spconv_fix(checkpoint_path):
     return state_dict
 
 
+def _infer_opv2v_frame_meta(dataset_obj, sample_idx):
+    """
+    Best-effort OPV2V/V2V4Real frame metadata extraction.
+
+    Returns (sequence_id, frame_id) where sequence_id is the scenario folder
+    name and frame_id is the timestamp string.
+    """
+    if dataset_obj is None:
+        return None, None
+    if not hasattr(dataset_obj, "len_record") or not hasattr(dataset_obj, "scenario_database"):
+        return None, None
+    try:
+        len_record = list(getattr(dataset_obj, "len_record"))
+        scenario_index = 0
+        for i, ele in enumerate(len_record):
+            if int(sample_idx) < int(ele):
+                scenario_index = int(i)
+                break
+        scenario_database = dataset_obj.scenario_database[int(scenario_index)]
+        timestamp_index = int(sample_idx) if scenario_index == 0 else int(sample_idx) - int(len_record[scenario_index - 1])
+        if hasattr(dataset_obj, "return_timestamp_key"):
+            timestamp_key = dataset_obj.return_timestamp_key(scenario_database, timestamp_index)
+        else:
+            timestamp_keys = list(list(scenario_database.items())[0][1].keys())
+            timestamp_key = timestamp_keys[int(timestamp_index)]
+        seq_id = None
+        if hasattr(dataset_obj, "scenario_folders"):
+            seq_id = os.path.basename(os.path.normpath(dataset_obj.scenario_folders[int(scenario_index)]))
+        return str(seq_id) if seq_id is not None else None, str(timestamp_key)
+    except Exception:
+        return None, None
+
+
 def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=None, bev_feature_cfg=None, train_eval_mode=False):
     feature_cfg = feature_cfg or {}
     bev_feature_cfg = bev_feature_cfg or {}
@@ -649,6 +682,7 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
                         infra_path = frame_info.get('infrastructure_image_path')
                         if infra_path:
                             infra_frame_id = infra_path.split('/')[-1].split('.')[0]
+                seq_id, frame_id = _infer_opv2v_frame_meta(dataset_obj, sample_idx)
                 print(i, sample_idx_str, cav_id_list)
                 output_stage1 = stage1_model(batch_data['ego'])
                 if isinstance(output_stage1, dict) and 'unc_preds' not in output_stage1:
@@ -734,6 +768,10 @@ def export_stage1_boxes(prepared_hypes, splits, feature_cfg=None, max_samples=No
                     stage1_boxes_dict[sample_idx_str]['bev_range'] = cav_lidar_range
                     stage1_boxes_dict[sample_idx_str]['veh_frame_id'] = veh_frame_id
                     stage1_boxes_dict[sample_idx_str]['infra_frame_id'] = infra_frame_id
+                    if frame_id is not None:
+                        stage1_boxes_dict[sample_idx_str]['frame_id'] = frame_id
+                    if seq_id is not None:
+                        stage1_boxes_dict[sample_idx_str]['sequence_id'] = seq_id
                     combined_features = None
                     if feature_entries:
                         combined_features = [list(boxes) for boxes, _ in feature_entries]
@@ -855,6 +893,10 @@ def merge_stage1_outputs(infra_stage1_path, vehicle_stage1_path, merged_output_d
             record['veh_frame_id'] = infra_entry.get('veh_frame_id') or veh_entry.get('veh_frame_id')
         if 'infra_frame_id' in infra_entry or 'infra_frame_id' in veh_entry:
             record['infra_frame_id'] = infra_entry.get('infra_frame_id') or veh_entry.get('infra_frame_id')
+        if 'frame_id' in infra_entry or 'frame_id' in veh_entry:
+            record['frame_id'] = infra_entry.get('frame_id') or veh_entry.get('frame_id')
+        if 'sequence_id' in infra_entry or 'sequence_id' in veh_entry:
+            record['sequence_id'] = infra_entry.get('sequence_id') or veh_entry.get('sequence_id')
         if 'bev_range' in infra_entry:
             record['bev_range'] = infra_entry['bev_range']
         elif 'bev_range' in veh_entry:

@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Dict, List, Optional
 
 import numpy as np
+import torch
 from scipy.optimize import linear_sum_assignment
 from scipy.sparse.linalg import eigsh
 
@@ -43,9 +44,17 @@ class VIPSEstimator:
     VIPS is initial-value-based because it relies on `world_position` computed from `T_init`.
     """
 
-    def __init__(self, *, match_threshold: float = 0.5, match_distance_thr_m: float = 8.0) -> None:
+    def __init__(
+        self,
+        *,
+        match_threshold: float = 0.5,
+        match_distance_thr_m: float = 8.0,
+        device: Optional[str] = None,
+    ) -> None:
         self._match_threshold = float(match_threshold)
         self._match_distance_thr_m = float(match_distance_thr_m)
+        self._device = torch.device(device) if device else None
+        self._use_torch = bool(self._device and self._device.type == "cuda" and torch.cuda.is_available())
 
     @staticmethod
     def _node_similarity(n1: np.ndarray, n2: np.ndarray) -> float:
@@ -88,6 +97,11 @@ class VIPSEstimator:
         L2 = len(infra_graph["category"])
         if L1 == 0 or L2 == 0:
             return np.zeros((0, 2), dtype=np.int32)
+        if self._use_torch:
+            try:
+                return self._run_graph_matching_torch(veh_graph, infra_graph)
+            except Exception:
+                pass
         G1 = np.zeros((L1, 11), dtype=np.float64)
         G2 = np.zeros((L2, 11), dtype=np.float64)
         for i in range(L1):
@@ -166,6 +180,91 @@ class VIPSEstimator:
             w = (w - np.min(w)) / (np.max(w) - np.min(w))
 
         G = w.reshape(L1, L2)
+        rows, cols = linear_sum_assignment(-G)
+        kept = [(int(r), int(c)) for r, c in zip(rows, cols) if float(G[r, c]) >= self._match_threshold]
+        if not kept:
+            return np.zeros((0, 2), dtype=np.int32)
+        return np.asarray(kept, dtype=np.int32)
+
+    def _run_graph_matching_torch(self, veh_graph: Dict[str, List], infra_graph: Dict[str, List]) -> np.ndarray:
+        L1 = len(veh_graph["category"])
+        L2 = len(infra_graph["category"])
+        if L1 == 0 or L2 == 0:
+            return np.zeros((0, 2), dtype=np.int32)
+        device = self._device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        G1 = torch.zeros((L1, 11), device=device, dtype=torch.float64)
+        G2 = torch.zeros((L2, 11), device=device, dtype=torch.float64)
+        for i in range(L1):
+            G1[i, 0] = float(veh_graph["category"][i])
+            G1[i, 1:4] = torch.as_tensor(veh_graph["position"][i], dtype=torch.float64, device=device)
+            G1[i, 4:7] = torch.as_tensor(veh_graph["bounding_box"][i], dtype=torch.float64, device=device)
+            G1[i, 7:10] = torch.as_tensor(veh_graph["world_position"][i], dtype=torch.float64, device=device)
+            G1[i, 10] = float(veh_graph["heading"][i][0])
+        for i in range(L2):
+            G2[i, 0] = float(infra_graph["category"][i])
+            G2[i, 1:4] = torch.as_tensor(infra_graph["position"][i], dtype=torch.float64, device=device)
+            G2[i, 4:7] = torch.as_tensor(infra_graph["bounding_box"][i], dtype=torch.float64, device=device)
+            G2[i, 7:10] = torch.as_tensor(infra_graph["world_position"][i], dtype=torch.float64, device=device)
+            G2[i, 10] = float(infra_graph["heading"][i][0])
+
+        dim = L1 * L2
+        cats1 = G1[:, 0].to(dtype=torch.long)
+        cats2 = G2[:, 0].to(dtype=torch.long)
+
+        lambda_1 = 0.5
+        lambda_2 = 0.1
+        miu_1 = 0.5
+        miu_2 = 0.5
+        cat_eq = cats1[:, None] == cats2[None, :]
+        dim_xy_1 = G1[:, 4:6]
+        dim_xy_2 = G2[:, 4:6]
+        dim_diff = dim_xy_1[:, None, :] - dim_xy_2[None, :, :]
+        f_2 = torch.exp(-lambda_1 * torch.sum(dim_diff * dim_diff, dim=2))
+        wp_xy_1 = G1[:, 7:9]
+        wp_xy_2 = G2[:, 7:9]
+        wp_dist = torch.linalg.norm(wp_xy_1[:, None, :] - wp_xy_2[None, :, :], dim=2)
+        f_4 = torch.exp(-lambda_2 * wp_dist)
+        node_sim = cat_eq.to(dtype=torch.float64) * (miu_1 * f_2 + miu_2 * f_4)
+
+        lambda_3 = 0.5
+        lambda_4 = 0.1
+        miu_3 = 0.5
+        miu_4 = 0.5
+        pos_xy_1 = G1[:, 1:3]
+        pos_xy_2 = G2[:, 1:3]
+        d1 = torch.cdist(pos_xy_1, pos_xy_1, p=2)
+        d2 = torch.cdist(pos_xy_2, pos_xy_2, p=2)
+        g_2 = torch.exp(-lambda_3 * (d1[:, :, None, None] - d2[None, None, :, :]) ** 2)
+
+        h1 = G1[:, 10]
+        h2 = G2[:, 10]
+        sin1 = torch.sin(h1[:, None] - h1[None, :])
+        sin2 = torch.sin(h2[:, None] - h2[None, :])
+        g_3 = torch.exp(-lambda_4 * torch.abs(sin1[:, :, None, None] - sin2[None, None, :, :]))
+
+        cond1 = cat_eq[:, None, :, None] & cat_eq[None, :, None, :]
+        cond2 = cat_eq[:, None, None, :] & cat_eq[None, :, :, None]
+        g_1 = (cond1 | cond2).to(dtype=torch.float64)
+
+        edge_sim = g_1 * (miu_3 * g_2 + miu_4 * g_3)
+        M = edge_sim.permute(0, 2, 1, 3).reshape(dim, dim)
+        idx = torch.arange(dim, device=device)
+        M[idx, idx] = node_sim.reshape(dim)
+
+        try:
+            _, eigvecs = torch.linalg.eigh(M)
+            w = eigvecs[:, -1]
+        except Exception:
+            M_cpu = M.detach().cpu().numpy()
+            _, eigvecs = np.linalg.eigh(M_cpu)
+            w = torch.as_tensor(eigvecs[:, -1], device=device, dtype=torch.float64)
+
+        w_min = torch.min(w)
+        w_max = torch.max(w)
+        if float(w_max - w_min) > 0:
+            w = (w - w_min) / (w_max - w_min)
+        G = w.reshape(L1, L2).detach().cpu().numpy()
+
         rows, cols = linear_sum_assignment(-G)
         kept = [(int(r), int(c)) for r, c in zip(rows, cols) if float(G[r, c]) >= self._match_threshold]
         if not kept:

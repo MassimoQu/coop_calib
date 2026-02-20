@@ -16,6 +16,51 @@ def _delta_angle_deg(a: float, b: float) -> float:
     return float(_wrap_angle_deg(a - b))
 
 
+def _normalize_agent_role(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    name = str(raw).lower()
+    if "veh" in name or "vehicle" in name:
+        return "vehicle"
+    if "infra" in name or "rsu" in name or "infrastructure" in name:
+        return "infrastructure"
+    return None
+
+
+def _infer_dair_role_from_base(base_data_dict: Mapping[Any, Any], cav_id: Any) -> Optional[str]:
+    entry = base_data_dict.get(cav_id)
+    if not isinstance(entry, Mapping):
+        return None
+    params = entry.get("params") or {}
+    if not isinstance(params, Mapping):
+        return None
+    vehicles_all = params.get("vehicles_all")
+    if isinstance(vehicles_all, list):
+        return "vehicle" if len(vehicles_all) > 0 else "infrastructure"
+    vehicles_front = params.get("vehicles_front")
+    if isinstance(vehicles_front, list):
+        return "vehicle" if len(vehicles_front) > 0 else "infrastructure"
+    return None
+
+
+def _resolve_agent_index(
+    all_agent_ids: Sequence[Any],
+    cav_id: Any,
+    base_data_dict: Mapping[Any, Any],
+) -> Optional[int]:
+    cav_str = str(cav_id)
+    for idx, agent_id in enumerate(all_agent_ids):
+        if str(agent_id) == cav_str:
+            return int(idx)
+    role = _infer_dair_role_from_base(base_data_dict, cav_id)
+    if role is None:
+        return None
+    for idx, agent_id in enumerate(all_agent_ids):
+        if _normalize_agent_role(agent_id) == role:
+            return int(idx)
+    return None
+
+
 def _smooth_se2(
     prev: Tuple[float, float, float],
     cur: Tuple[float, float, float],
@@ -129,8 +174,6 @@ class Stage1PGCPoseCorrector:
             return False
         if not all_agent_ids or not poses:
             return False
-        cav_ids_str = [str(c) for c in all_agent_ids]
-
         if not cav_id_list:
             return False
         ego_id = cav_id_list[0]
@@ -165,10 +208,7 @@ class Stage1PGCPoseCorrector:
                 return None
 
         # Ego predicted pose is used only to derive the relative estimate.
-        try:
-            ego_pred_idx = cav_ids_str.index(str(ego_id))
-        except ValueError:
-            ego_pred_idx = None
+        ego_pred_idx = _resolve_agent_index(all_agent_ids, ego_id, base_data_dict)
         ego_pose_pred = _pose6_at(int(ego_pred_idx)) if ego_pred_idx is not None else None
         if ego_pose_pred is None:
             return False
@@ -184,9 +224,8 @@ class Stage1PGCPoseCorrector:
             if cav_id not in base_data_dict:
                 continue
 
-            try:
-                cav_pred_idx = cav_ids_str.index(str(cav_id))
-            except ValueError:
+            cav_pred_idx = _resolve_agent_index(all_agent_ids, cav_id, base_data_dict)
+            if cav_pred_idx is None:
                 continue
             cav_pose_pred = _pose6_at(int(cav_pred_idx))
             if cav_pose_pred is None:
@@ -264,4 +303,3 @@ class Stage1PGCPoseCorrector:
 
 
 __all__ = ["Stage1PGCPoseCorrector"]
-

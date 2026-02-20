@@ -27,7 +27,7 @@ from opencood.utils.camera_utils import (
 )
 from opencood.utils.common_utils import merge_features_to_dict, compute_iou, convert_format
 from opencood.utils.transformation_utils import x1_to_x2, x_to_world, get_pairwise_transformation
-from opencood.utils.pose_utils import add_noise_data_dict
+from opencood.utils.pose_utils import add_noise_data_dict, apply_pose_overrides, override_lidar_poses
 from opencood.data_utils.pre_processor import build_preprocessor
 from opencood.utils.pcd_utils import (
     mask_points_by_range,
@@ -90,6 +90,27 @@ def getIntermediateheterinferFusionDataset(cls):
             assert ego_id != -1
             assert len(ego_lidar_pose) > 0
 
+            if getattr(self, "pose_override_enabled", False):
+                if getattr(self, "pose_override_map", None):
+                    apply_pose_overrides(
+                        base_data_dict,
+                        override_map=self.pose_override_map,
+                        sample_idx=idx,
+                        pose_field=getattr(self, "pose_override_pose_field", "lidar_pose_pred_np"),
+                        confidence_field=getattr(self, "pose_override_confidence_field", "pose_confidence_np"),
+                        apply_to=getattr(self, "pose_override_apply_to", "non-ego"),
+                        freeze_ego=getattr(self, "pose_override_freeze_ego", True),
+                    )
+                else:
+                    override_lidar_poses(
+                        base_data_dict,
+                        mode=getattr(self, "pose_override_mode", "ego"),
+                        apply_to=getattr(self, "pose_override_apply_to", "non-ego"),
+                        ego_id=ego_id,
+                        set_confidence=getattr(self, "pose_override_confidence", None),
+                    )
+                ego_lidar_pose = base_data_dict[ego_id]["params"]["lidar_pose"]
+
             
             input_list_m1 = [] # can contain lidar or camera
             input_list_m2 = []
@@ -143,35 +164,6 @@ def getIntermediateheterinferFusionDataset(cls):
 
             for cav_id in exclude_agent:
                 base_data_dict.pop(cav_id)
-
-            ########## Updated by Yifan Lu 2022.1.26 ############
-            # box align to correct pose.
-            # stage1_content contains all agent. Even out of comm range.
-            if self.box_align and str(idx) in self.stage1_result.keys():
-                from opencood.extrinsics.pose_correction import Stage1BoxAlignPoseCorrector
-
-                corrector = Stage1BoxAlignPoseCorrector(box_align_args=self.box_align_args)
-                corrected = corrector.apply(
-                    sample_idx=idx,
-                    cav_id_list=cav_id_list,
-                    base_data_dict=base_data_dict,
-                    stage1_result=self.stage1_result,
-                )
-                if corrected:
-                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
-
-
-            if getattr(self, "v2xregpp_align", False) and str(idx) in getattr(self, "v2xregpp_stage1_result", {}).keys():
-                corrected = self.v2xregpp_corrector.apply(
-                    sample_idx=idx,
-                    cav_id_list=cav_id_list,
-                    base_data_dict=base_data_dict,
-                    stage1_result=self.v2xregpp_stage1_result,
-                )
-                if corrected:
-                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
-
-
 
             pairwise_t_matrix = \
                 get_pairwise_transformation(base_data_dict,

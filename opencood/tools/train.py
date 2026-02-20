@@ -175,6 +175,7 @@ def main():
             model.zero_grad()
             optimizer.zero_grad()
             batch_data = train_utils.to_device(batch_data, device)
+            batch_data = train_utils.maybe_apply_pose_provider(batch_data, hypes)
             batch_data['ego']['epoch'] = epoch
             ouput_dict = model(batch_data['ego'])
             
@@ -210,6 +211,7 @@ def main():
                     model.eval()
 
                     batch_data = train_utils.to_device(batch_data, device)
+                    batch_data = train_utils.maybe_apply_pose_provider(batch_data, hypes)
                     batch_data['ego']['epoch'] = epoch
                     ouput_dict = model(batch_data['ego'])
 

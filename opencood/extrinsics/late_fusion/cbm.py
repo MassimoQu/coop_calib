@@ -30,6 +30,7 @@ class CBMEstimator:
         sigma2_m: float = 3.0,
         sigma3_m: float = 1.0,
         absolute_dis_lim_m: float = 20.0,
+        device: Optional[str] = None,
     ) -> None:
         self._cbm_args = type(
             "_CBMArgs",
@@ -42,6 +43,7 @@ class CBMEstimator:
             },
         )()
         self._matcher = None
+        self._device = device
 
     def _get_matcher(self):
         if self._matcher is not None:
@@ -53,7 +55,7 @@ class CBMEstimator:
             raise RuntimeError(
                 "CBMEstimator requires PyTorch; please install `torch` in your runtime environment."
             ) from exc
-        self._matcher = CBMMatcher(args=self._cbm_args)
+        self._matcher = CBMMatcher(args=self._cbm_args, device=self._device)
         return self._matcher
 
     def estimate_from_corners(
@@ -91,7 +93,25 @@ class CBMEstimator:
         ego_array = bbox_list_to_array7(veh_boxes)
 
         matcher = self._get_matcher()
-        matching = matcher(ego_array, cav_array, T_init)
+        use_torch = False
+        if self._device:
+            try:
+                import torch
+
+                device = torch.device(str(self._device))
+                use_torch = torch.cuda.is_available() and device.type == "cuda"
+            except Exception:
+                use_torch = False
+
+        if use_torch:
+            import torch
+
+            ego_tensor = torch.as_tensor(ego_array, dtype=torch.float32, device=device)
+            cav_tensor = torch.as_tensor(cav_array, dtype=torch.float32, device=device)
+            T_init_tensor = torch.as_tensor(T_init, dtype=torch.float32, device=device)
+            matching = matcher(ego_tensor, cav_tensor, T_init_tensor)
+        else:
+            matching = matcher(ego_array, cav_array, T_init)
         if hasattr(matching, "detach"):
             matching = matching.detach().cpu().numpy()
         matching = np.asarray(matching, dtype=np.int32)

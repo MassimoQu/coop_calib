@@ -5,6 +5,7 @@
 """
 Transform points to voxels using sparse conv library
 """
+import os
 import sys
 
 import numpy as np
@@ -109,6 +110,8 @@ class SpVoxelPreprocessor(BasePreprocessor):
                                                   train)
         self.spconv = 0
         VoxelGenerator = None
+        VoxelGeneratorGPU = None
+        TorchPointToVoxel = None
         try:
             # spconv v1.x
             from spconv.utils import VoxelGeneratorV2 as VoxelGenerator  # type: ignore
@@ -118,6 +121,11 @@ class SpVoxelPreprocessor(BasePreprocessor):
                 # spconv v2.x
                 from cumm import tensorview as tv  # type: ignore
                 from spconv.utils import Point2VoxelCPU3d as VoxelGenerator  # type: ignore
+                from spconv.utils import Point2VoxelGPU3d as VoxelGeneratorGPU  # type: ignore
+                try:
+                    from spconv.pytorch.utils import PointToVoxel as TorchPointToVoxel  # type: ignore
+                except Exception:
+                    TorchPointToVoxel = None
                 self.tv = tv
                 self.spconv = 2
             except Exception:
@@ -145,13 +153,42 @@ class SpVoxelPreprocessor(BasePreprocessor):
                 max_voxels=self.max_voxels
             )
         elif self.spconv == 2:
-            self.voxel_generator = VoxelGenerator(
-                vsize_xyz=self.voxel_size,
-                coors_range_xyz=self.lidar_range,
-                max_num_points_per_voxel=self.max_points_per_voxel,
-                num_point_features=4,
-                max_num_voxels=self.max_voxels
-            )
+            env_flag = os.environ.get("OPENCOOD_VOXEL_GPU", "")
+            use_gpu_flag = str(self.params.get("use_gpu_voxel", "")) if isinstance(self.params, dict) else ""
+            use_gpu = str(env_flag or use_gpu_flag or "").lower() in {"1", "true", "yes", "on"}
+            self.use_gpu = bool(use_gpu and torch.cuda.is_available() and VoxelGeneratorGPU is not None)
+            self.device = torch.device("cuda" if self.use_gpu else "cpu")
+            if self.use_gpu:
+                if TorchPointToVoxel is not None:
+                    self.voxel_generator = TorchPointToVoxel(
+                        self.voxel_size,
+                        self.lidar_range,
+                        4,
+                        self.max_voxels,
+                        self.max_points_per_voxel,
+                        device=self.device,
+                    )
+                    self.spconv = 4
+                else:
+                    # Fallback to low-level GPU voxelizer if torch wrapper is unavailable.
+                    # Point2VoxelGPU3d expects positional args:
+                    # (vsize_xyz, coors_range_xyz, num_point_features, max_num_voxels, max_num_points_per_voxel)
+                    self.voxel_generator = VoxelGeneratorGPU(
+                        self.voxel_size,
+                        self.lidar_range,
+                        4,
+                        self.max_voxels,
+                        self.max_points_per_voxel,
+                    )
+                    self.spconv = 3
+            else:
+                self.voxel_generator = VoxelGenerator(
+                    vsize_xyz=self.voxel_size,
+                    coors_range_xyz=self.lidar_range,
+                    max_num_points_per_voxel=self.max_points_per_voxel,
+                    num_point_features=4,
+                    max_num_voxels=self.max_voxels
+                )
         else:
             self.voxel_generator = _NumpyVoxelGenerator(
                 voxel_size=self.voxel_size,
@@ -162,17 +199,25 @@ class SpVoxelPreprocessor(BasePreprocessor):
 
     def preprocess(self, pcd_np):
         data_dict = {}
-        if self.spconv == 2:
+        voxel_output = None
+        if self.spconv == 4:
+            pts = torch.as_tensor(pcd_np, device=self.device, dtype=torch.float32)
+            voxels, coordinates, num_points = self.voxel_generator(pts)
+        elif self.spconv == 3:
+            pts = torch.as_tensor(pcd_np, device=self.device, dtype=torch.float32)
+            voxel_output = self.voxel_generator.point_to_voxel_hash(pts)
+        elif self.spconv == 2:
             pcd_tv = self.tv.from_numpy(pcd_np)
             voxel_output = self.voxel_generator.point_to_voxel(pcd_tv)
         else:
             voxel_output = self.voxel_generator.generate(pcd_np)
-        if isinstance(voxel_output, dict):
-            voxels, coordinates, num_points = \
-                voxel_output['voxels'], voxel_output['coordinates'], \
-                voxel_output['num_points_per_voxel']
-        else:
-            voxels, coordinates, num_points = voxel_output
+        if voxel_output is not None:
+            if isinstance(voxel_output, dict):
+                voxels, coordinates, num_points = \
+                    voxel_output['voxels'], voxel_output['coordinates'], \
+                    voxel_output['num_points_per_voxel']
+            else:
+                voxels, coordinates, num_points = voxel_output
 
         if self.spconv == 2:
             voxels = voxels.numpy()
@@ -230,13 +275,22 @@ class SpVoxelPreprocessor(BasePreprocessor):
             voxel_features.append(batch[i]['voxel_features'])
             voxel_num_points.append(batch[i]['voxel_num_points'])
             coords = batch[i]['voxel_coords']
-            voxel_coords.append(
-                np.pad(coords, ((0, 0), (1, 0)),
-                       mode='constant', constant_values=i))
+            if isinstance(coords, torch.Tensor):
+                pad = torch.full((coords.shape[0], 1), i, dtype=coords.dtype, device=coords.device)
+                voxel_coords.append(torch.cat([pad, coords], dim=1))
+            else:
+                voxel_coords.append(
+                    np.pad(coords, ((0, 0), (1, 0)),
+                           mode='constant', constant_values=i))
 
-        voxel_num_points = torch.from_numpy(np.concatenate(voxel_num_points))
-        voxel_features = torch.from_numpy(np.concatenate(voxel_features))
-        voxel_coords = torch.from_numpy(np.concatenate(voxel_coords))
+        if isinstance(voxel_features[0], torch.Tensor):
+            voxel_num_points = torch.cat(voxel_num_points, dim=0)
+            voxel_features = torch.cat(voxel_features, dim=0)
+            voxel_coords = torch.cat(voxel_coords, dim=0)
+        else:
+            voxel_num_points = torch.from_numpy(np.concatenate(voxel_num_points))
+            voxel_features = torch.from_numpy(np.concatenate(voxel_features))
+            voxel_coords = torch.from_numpy(np.concatenate(voxel_coords))
 
         return {'voxel_features': voxel_features,
                 'voxel_coords': voxel_coords,
@@ -257,18 +311,29 @@ class SpVoxelPreprocessor(BasePreprocessor):
         processed_batch : dict
             Updated lidar batch.
         """
-        voxel_features = \
-            torch.from_numpy(np.concatenate(batch['voxel_features']))
-        voxel_num_points = \
-            torch.from_numpy(np.concatenate(batch['voxel_num_points']))
+        if isinstance(batch['voxel_features'][0], torch.Tensor):
+            voxel_features = torch.cat(batch['voxel_features'], dim=0)
+            voxel_num_points = torch.cat(batch['voxel_num_points'], dim=0)
+        else:
+            voxel_features = \
+                torch.from_numpy(np.concatenate(batch['voxel_features']))
+            voxel_num_points = \
+                torch.from_numpy(np.concatenate(batch['voxel_num_points']))
         coords = batch['voxel_coords']
         voxel_coords = []
 
         for i in range(len(coords)):
-            voxel_coords.append(
-                np.pad(coords[i], ((0, 0), (1, 0)),
-                       mode='constant', constant_values=i))
-        voxel_coords = torch.from_numpy(np.concatenate(voxel_coords))
+            if isinstance(coords[i], torch.Tensor):
+                pad = torch.full((coords[i].shape[0], 1), i, dtype=coords[i].dtype, device=coords[i].device)
+                voxel_coords.append(torch.cat([pad, coords[i]], dim=1))
+            else:
+                voxel_coords.append(
+                    np.pad(coords[i], ((0, 0), (1, 0)),
+                           mode='constant', constant_values=i))
+        if isinstance(voxel_coords[0], torch.Tensor):
+            voxel_coords = torch.cat(voxel_coords, dim=0)
+        else:
+            voxel_coords = torch.from_numpy(np.concatenate(voxel_coords))
 
         return {'voxel_features': voxel_features,
                 'voxel_coords': voxel_coords,

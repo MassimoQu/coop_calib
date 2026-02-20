@@ -10,6 +10,8 @@ import re
 from datetime import datetime
 import shutil
 import torch
+
+from opencood.utils.pose_provider_runtime import PoseProviderConfig, apply_pose_provider
 import torch.optim as optim
 
 def backup_script(full_path, folders_to_save=["models", "data_utils", "utils", "loss"]):
@@ -346,3 +348,36 @@ def to_device(inputs, device):
                 or isinstance(inputs, str) or not hasattr(inputs, 'to'):
             return inputs
         return inputs.to(device, non_blocking=True)
+
+
+
+def _pose_provider_signature(hypes):
+    if not isinstance(hypes, dict):
+        return "<invalid-hypes>"
+    payload = {
+        "pose_provider": hypes.get("pose_provider"),
+        "pose_override": hypes.get("pose_override"),
+        "fusion_proj_first": ((hypes.get("fusion") or {}).get("args") or {}).get("proj_first"),
+        "train_max_cav": (hypes.get("train_params") or {}).get("max_cav"),
+    }
+    try:
+        return yaml.safe_dump(payload, sort_keys=True)
+    except Exception:
+        return repr(payload)
+
+
+def maybe_apply_pose_provider(batch_data, hypes):
+    if not isinstance(hypes, dict):
+        cfg = PoseProviderConfig.from_hypes(hypes)
+    else:
+        signature = _pose_provider_signature(hypes)
+        cache_key = "_pose_provider_runtime_cfg"
+        sig_key = "_pose_provider_runtime_sig"
+        cfg = hypes.get(cache_key)
+        if cfg is None or hypes.get(sig_key) != signature:
+            cfg = PoseProviderConfig.from_hypes(hypes)
+            hypes[cache_key] = cfg
+            hypes[sig_key] = signature
+    if not cfg.enabled:
+        return batch_data
+    return apply_pose_provider(batch_data, cfg)

@@ -5,10 +5,98 @@
 from PIL import Image
 import numpy as np
 import torch
-import torchvision
 import cv2
 import math
+import warnings
 from shapely.geometry import Point, MultiPoint
+
+
+try:
+    import torchvision
+    _tv_transforms = torchvision.transforms
+except Exception as exc:  # pragma: no cover - environment dependent
+    torchvision = None
+    _tv_transforms = None
+    warnings.warn(
+        f"torchvision import failed ({exc}). Falling back to minimal image transforms; "
+        "camera-model features that require torchvision backbones will be unavailable.",
+        RuntimeWarning,
+    )
+
+
+class _FallbackCompose:
+    def __init__(self, transforms):
+        self.transforms = list(transforms)
+
+    def __call__(self, value):
+        out = value
+        for transform in self.transforms:
+            out = transform(out)
+        return out
+
+
+class _FallbackToTensor:
+    def __call__(self, value):
+        if torch.is_tensor(value):
+            tensor = value
+        elif isinstance(value, np.ndarray):
+            array = value
+            if array.ndim == 2:
+                array = array[:, :, None]
+            tensor = torch.from_numpy(np.transpose(array, (2, 0, 1)))
+        else:
+            array = np.array(value, copy=True)
+            if array.ndim == 2:
+                array = array[:, :, None]
+            tensor = torch.from_numpy(np.transpose(array, (2, 0, 1)))
+        tensor = tensor.contiguous()
+        if tensor.dtype == torch.uint8:
+            return tensor.float().div(255.0)
+        return tensor.float()
+
+
+class _FallbackToPILImage:
+    def __call__(self, value):
+        if isinstance(value, Image.Image):
+            return value
+        if torch.is_tensor(value):
+            tensor = value.detach().cpu()
+            if tensor.ndim == 3:
+                tensor = tensor.permute(1, 2, 0)
+            array = tensor.numpy()
+        elif isinstance(value, np.ndarray):
+            array = value
+        else:
+            raise TypeError(f"Unsupported value type for ToPILImage fallback: {type(value)!r}")
+        if array.ndim == 3 and array.shape[2] == 1:
+            array = array[:, :, 0]
+        if np.issubdtype(array.dtype, np.floating):
+            array = np.clip(array, 0.0, 1.0)
+            array = (array * 255.0 + 0.5).astype(np.uint8)
+        elif array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        return Image.fromarray(array)
+
+
+class _FallbackNormalize:
+    def __init__(self, mean, std):
+        self.mean = torch.as_tensor(mean).view(-1, 1, 1)
+        self.std = torch.as_tensor(std).view(-1, 1, 1)
+
+    def __call__(self, tensor):
+        mean = self.mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = self.std.to(device=tensor.device, dtype=tensor.dtype)
+        return (tensor - mean) / std
+
+
+if _tv_transforms is None:
+    class _FallbackTransforms:
+        Compose = _FallbackCompose
+        ToTensor = _FallbackToTensor
+        ToPILImage = _FallbackToPILImage
+        Normalize = _FallbackNormalize
+
+    _tv_transforms = _FallbackTransforms
 
 def load_camera_data(camera_files, preload=True):
     """
@@ -103,7 +191,7 @@ def get_rot(h):
         [-np.sin(h), np.cos(h)],
     ])
 
-class NormalizeInverse(torchvision.transforms.Normalize):
+class NormalizeInverse(_tv_transforms.Normalize):
     #  https://discuss.pytorch.org/t/simple-way-to-inverse-transform-normalization/4821/8
     def __init__(self, mean, std):
         mean = torch.as_tensor(mean)
@@ -116,20 +204,20 @@ class NormalizeInverse(torchvision.transforms.Normalize):
         return super().__call__(tensor.clone())
 
 
-denormalize_img = torchvision.transforms.Compose((
+denormalize_img = _tv_transforms.Compose((
             NormalizeInverse(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
-            torchvision.transforms.ToPILImage(),
+            _tv_transforms.ToPILImage(),
         ))
 
 
-normalize_img = torchvision.transforms.Compose((
-                torchvision.transforms.ToTensor(),
-                torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
+normalize_img = _tv_transforms.Compose((
+                _tv_transforms.ToTensor(),
+                _tv_transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225]),
 ))
 
-img_to_tensor = torchvision.transforms.ToTensor() # [0,255] -> [0,1]
+img_to_tensor = _tv_transforms.ToTensor() # [0,255] -> [0,1]
 
 
 def gen_dx_bx(xbound, ybound, zbound):

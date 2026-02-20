@@ -209,6 +209,14 @@ class FreeAlignRepoConfig:
     max_step_xy_m: float = 3.0
     max_step_yaw_deg: float = 10.0
 
+    # Optional: compare against current pose and keep the better alignment.
+    compare_with_current: bool = False
+    compare_distance_threshold_m: float = 3.0
+    min_precision: float = 0.0
+    apply_if_current_precision_below: float = -1.0
+    min_precision_improvement: float = 0.0
+    min_matched_improvement: int = 0
+
 
 class FreeAlignRepoEstimator:
     def __init__(self, cfg: Optional[FreeAlignRepoConfig] = None) -> None:

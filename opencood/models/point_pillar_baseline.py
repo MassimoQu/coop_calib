@@ -116,7 +116,14 @@ class PointPillarBaseline(nn.Module):
         batch_dict = self.scatter(batch_dict)
         # calculate pairwise affine transformation matrix
         _, _, H0, W0 = batch_dict['spatial_features'].shape # original feature map shape H0, W0
-        affine_matrix = normalize_pairwise_tfm(data_dict['pairwise_t_matrix'], H0, W0, self.voxel_size[0])
+        pairwise_t_matrix = data_dict.get('pairwise_t_matrix')
+        if pairwise_t_matrix is None:
+            # Allow "no extrinsics input" runs (e.g. calibfree fusion). Downstream
+            # fusion can ignore this matrix if it estimates alignment itself.
+            B = int(record_len.shape[0])
+            L = int(record_len.max().item())
+            pairwise_t_matrix = torch.eye(4, device=voxel_features.device, dtype=voxel_features.dtype).view(1, 1, 1, 4, 4).repeat(B, L, L, 1, 1)
+        affine_matrix = normalize_pairwise_tfm(pairwise_t_matrix, H0, W0, self.voxel_size[0])
         batch_dict = self.backbone(batch_dict)
 
         spatial_features_2d = batch_dict['spatial_features_2d']
@@ -139,7 +146,7 @@ class PointPillarBaseline(nn.Module):
             fused_feature = self.fusion_net(spatial_features_2d,
                                             record_len,
                                             affine_matrix,
-                                            data_dict.get('pairwise_t_matrix'))
+                                            pairwise_t_matrix if 'pairwise_t_matrix' in data_dict else None)
         else:
             fused_feature = self.fusion_net(spatial_features_2d, record_len, affine_matrix)
 

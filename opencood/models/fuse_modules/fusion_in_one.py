@@ -4,6 +4,7 @@
 
 import torch
 from torch import nn
+from typing import Optional
 from opencood.models.sub_modules.torch_transformation_utils import \
     warp_affine_simple
 from opencood.models.fuse_modules.fuse_utils import regroup as Regroup
@@ -323,6 +324,17 @@ class V2XViTFusion(nn.Module):
         from opencood.models.sub_modules.v2xvit_basic import V2XTransformer
         self.fusion_net = V2XTransformer(args['transformer'])
 
+        # Optional "calibration-free" (no external pose) alignment path.
+        # When enabled, we ignore affine_matrix / pairwise_t_matrix and estimate an
+        # ego->cav SE(2) warp from BEV features via phase correlation.
+        from opencood.models.fuse_modules.calibfree_align import CalibFreeAlignConfig, CalibFreeAligner
+        self._calibfree_cfg = CalibFreeAlignConfig.from_dict(args.get("calibfree"))
+        self._calibfree_enabled = bool(self._calibfree_cfg.enabled)
+        self._calibfree_aligner = CalibFreeAligner(self._calibfree_cfg) if self._calibfree_enabled else None
+        # Debug hooks (populated on forward when calibfree is enabled).
+        self.last_calibfree_affine: Optional[torch.Tensor] = None  # (B,L,2,3)
+        self.last_calibfree_scores: Optional[torch.Tensor] = None  # (B,L)
+
     def forward(self, x, record_len, affine_matrix, pairwise_t_matrix=None):
         """
         Fusion forwarding.
@@ -342,23 +354,57 @@ class V2XViTFusion(nn.Module):
         _, C, H, W = x.shape
         B, L = affine_matrix.shape[:2]
 
-        regroup_feature, mask = Regroup(x, record_len, L)
-        prior_encoding = \
-            torch.zeros(len(record_len), L, 3, 1, 1).to(record_len.device)
-        
+        regroup_feature, mask = Regroup(x, record_len, L)  # (B,L,C,H,W), (B,L)
+
+        # If enabled, estimate a pose-free ego->cav warp for each neighbor and warp
+        # features before passing them into the standard V2X-ViT transformer.
+        if self._calibfree_enabled and self._calibfree_aligner is not None:
+            warped_batches = []
+            last_affine = []
+            last_scores = []
+            for b in range(B):
+                N = int(record_len[b].item())
+                ego_feat = regroup_feature[b, 0]  # (C,H,W)
+                mats = []
+                scores = []
+                for i in range(L):
+                    if i == 0 or i >= N:
+                        mats.append(torch.tensor([[1.0, 0.0, 0.0],
+                                                  [0.0, 1.0, 0.0]],
+                                                 device=ego_feat.device,
+                                                 dtype=ego_feat.dtype))
+                        scores.append(torch.tensor(0.0, device=ego_feat.device, dtype=torch.float32))
+                        continue
+                    M_i, score_i = self._calibfree_aligner.estimate_affine(ego_feat, regroup_feature[b, i])
+                    mats.append(M_i)
+                    scores.append(torch.tensor(float(score_i), device=ego_feat.device, dtype=torch.float32))
+                M = torch.stack(mats, dim=0)  # (L,2,3)
+                warped_batches.append(warp_affine_simple(regroup_feature[b], M, (H, W)))
+                last_affine.append(M)
+                last_scores.append(torch.stack(scores, dim=0))
+            regroup_feature = torch.stack(warped_batches, dim=0)
+            # Expose the last predicted alignment (debug only).
+            self.last_calibfree_affine = torch.stack(last_affine, dim=0).detach()
+            self.last_calibfree_scores = torch.stack(last_scores, dim=0).detach()
+            # For true "no extrinsics input" experiments, also drop pose PE.
+            pairwise_t_matrix = None
+        else:
+            # Original path: use externally provided pairwise poses to warp into ego.
+            prior_warp = None  # placeholder for readability
+            _ = prior_warp
+            regroup_feature_new = []
+            for b in range(B):
+                ego = 0
+                regroup_feature_new.append(warp_affine_simple(regroup_feature[b], affine_matrix[b, ego], (H, W)))
+            regroup_feature = torch.stack(regroup_feature_new)
+
         # prior encoding should include [velocity, time_delay, infra], but it is not supported by all basedataset.
         # it is possible to modify the xxx_basedataset.py and intermediatefusiondataset.py to retrieve these information
+        prior_encoding = torch.zeros(len(record_len), L, 3, 1, 1).to(record_len.device)
         prior_encoding = prior_encoding.repeat(1, 1, 1,
                                                regroup_feature.shape[3],
                                                regroup_feature.shape[4])
-
         regroup_feature = torch.cat([regroup_feature, prior_encoding], dim=2)
-        regroup_feature_new = []
-
-        for b in range(B):
-            ego = 0
-            regroup_feature_new.append(warp_affine_simple(regroup_feature[b], affine_matrix[b, ego], (H, W)))
-        regroup_feature = torch.stack(regroup_feature_new)
 
         # b l c h w -> b l h w c
         regroup_feature = regroup_feature.permute(0, 1, 3, 4, 2)

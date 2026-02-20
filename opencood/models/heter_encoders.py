@@ -6,7 +6,6 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from opencood.models.sub_modules.lss_submodule import Up, CamEncode, BevEncode, CamEncode_Resnet101
 from opencood.utils.camera_utils import gen_dx_bx, cumsum_trick, QuickCumsum, depth_discretization
 from opencood.models.sub_modules.pillar_vfe import PillarVFE
 from opencood.models.sub_modules.point_pillar_scatter import PointPillarScatter
@@ -92,6 +91,8 @@ class SECOND(nn.Module):
 class LiftSplatShoot(nn.Module):
     def __init__(self, args): 
         super(LiftSplatShoot, self).__init__()
+        from opencood.models.sub_modules.lss_submodule import CamEncode, CamEncode_Resnet101
+
         self.grid_conf = args['grid_conf']   # 网格配置参数
         self.data_aug_conf = args['data_aug_conf']   # 数据增强配置参数
         dx, bx, nx = gen_dx_bx(self.grid_conf['xbound'],

@@ -20,7 +20,13 @@ class V2XRegPPEstimator:
         the prior can be used to gate correspondences.
     """
 
-    def __init__(self, *, config_path: str, matching_overrides: Optional[dict] = None) -> None:
+    def __init__(
+        self,
+        *,
+        config_path: str,
+        matching_overrides: Optional[dict] = None,
+        device: Optional[str] = None,
+    ) -> None:
         ensure_v2xreg_root_on_path()
         from calib.config import load_config  # type: ignore
 
@@ -34,7 +40,8 @@ class V2XRegPPEstimator:
         from calib.matching.engine import MatchingEngine  # type: ignore
 
         self._filters = FilterPipeline(self._cfg.filters)
-        self._matcher = MatchingEngine(self._cfg.matching)
+        self._device = device
+        self._matcher = MatchingEngine(self._cfg.matching, device=device)
 
     @property
     def config(self):
@@ -103,6 +110,7 @@ class V2XRegPPEstimator:
                 inlier_threshold_m=getattr(self._cfg.solver, "inlier_threshold_m", 0.0),
                 mad_scale=getattr(self._cfg.solver, "mad_scale", 2.5),
                 min_inliers=getattr(self._cfg.solver, "min_inliers", 1),
+                device=self._device,
             )
             T6 = solver.get_combined_extrinsic(matches2extrinsic_strategies=self._cfg.matching.matches2extrinsic)
             T = convert_6DOF_to_T(T6)

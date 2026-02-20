@@ -388,28 +388,23 @@ def get_pairwise_transformation_torch(lidar_poses, max_cav, record_len, dof):
         shape: (B, L, L, 4, 4), L is the max cav number in a scene
         pairwise_t_matrix[i, j] is Tji, i_to_j
     """
-    def regroup(x, record_len):
-        cum_sum_len = torch.cumsum(record_len, dim=0)
-        split_x = torch.tensor_split(x, cum_sum_len[:-1].cpu())
-        return split_x
+    B = int(record_len.shape[0])
+    pairwise_t_matrix = torch.eye(4, device=lidar_poses.device, dtype=lidar_poses.dtype).view(1, 1, 1, 4, 4).repeat(B, max_cav, max_cav, 1, 1)
 
-    B = len(record_len)
-    lidar_poses_list = regroup(lidar_poses, record_len)
-
-    pairwise_t_matrix = torch.eye(4, device=lidar_poses.device).view(1,1,1,4,4).repeat(B, max_cav, max_cav, 1, 1) # (B, L, L, 4, 4)
-    # save all transformation matrix in a list in order first.
+    start = 0
     for b in range(B):
-        lidar_poses = lidar_poses_list[b]  # [N_cav, 3] or [N_cav, 6]. 
-        t_list = pose_to_tfm(lidar_poses)  # Twx, [N_cav, 4, 4]
+        num = int(record_len[b].item())
+        if num <= 0:
+            continue
+        lidar_pose_b = lidar_poses[start : start + num]
+        start += num
 
-        for i in range(len(t_list)):
-            for j in range(len(t_list)):
-                # identity matrix to self
-                if i != j:
-                    # i->j: TiPi=TjPj, Tj^(-1)TiPi = Pj
-                    # t_matrix = np.dot(np.linalg.inv(t_list[j]), t_list[i])
-                    t_matrix = torch.linalg.solve(t_list[j], t_list[i])  # Tjw*Twi = Tji
-                    pairwise_t_matrix[b][i, j] = t_matrix
+        t_list = pose_to_tfm(lidar_pose_b)  # Twx, [N_cav, 4, 4]
+        t_inv = torch.linalg.inv(t_list)    # Txw, [N_cav, 4, 4]
+
+        # pairwise[i, j] = inv(T_jw) @ T_iw = T_ji
+        pairwise_ij = torch.matmul(t_inv.unsqueeze(0), t_list.unsqueeze(1))
+        pairwise_t_matrix[b, :num, :num] = pairwise_ij
 
     return pairwise_t_matrix
 

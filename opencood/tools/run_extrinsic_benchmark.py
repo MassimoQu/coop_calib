@@ -16,7 +16,8 @@ _HEAL_ROOT = Path(__file__).resolve().parents[2]
 if str(_HEAL_ROOT) not in sys.path:
     sys.path.insert(0, str(_HEAL_ROOT))
 
-from opencood.extrinsics.late_fusion import CBMEstimator, VIPSEstimator, V2XRegPPEstimator
+from opencood.extrinsics.late_fusion import CBMEstimator, ImageMatchingEstimator, VIPSEstimator, V2XRegPPEstimator
+from opencood.extrinsics.late_fusion.image_matching import ImageMatchingConfig
 from opencood.extrinsics.path_utils import ensure_v2xreg_root_on_path, resolve_repo_path
 from opencood.extrinsics.types import ExtrinsicEstimate, ExtrinsicInit, MethodContext
 
@@ -104,6 +105,19 @@ def run_once(
     data_info_override: Optional[str],
     detection_cache_override: Optional[str],
     out_dir: Path,
+    image_matcher: str,
+    image_max_features: int,
+    image_ratio_test: float,
+    image_cross_check: bool,
+    image_ransac_thresh: float,
+    image_ransac_confidence: float,
+    image_ransac_max_iters: int,
+    image_min_matches: int,
+    image_min_inliers: int,
+    image_resize_max_dim: int,
+    image_allow_no_intrinsics: bool,
+    image_t_scale: Optional[float],
+    image_device: str,
 ) -> dict:
     ensure_v2xreg_root_on_path()
     from calib.config import load_config  # type: ignore
@@ -144,6 +158,24 @@ def run_once(
         estimator = CBMEstimator()
     elif method == "vips":
         estimator = VIPSEstimator()
+    elif method == "image_match":
+        estimator = ImageMatchingEstimator(
+            cfg=ImageMatchingConfig(
+                matcher=str(image_matcher),
+                max_features=int(image_max_features),
+                ratio_test=float(image_ratio_test),
+                cross_check=bool(image_cross_check),
+                ransac_thresh_px=float(image_ransac_thresh),
+                ransac_confidence=float(image_ransac_confidence),
+                ransac_max_iters=int(image_ransac_max_iters),
+                min_matches=int(image_min_matches),
+                min_inliers=int(image_min_inliers),
+                resize_max_dim=int(image_resize_max_dim),
+                allow_no_intrinsics=bool(image_allow_no_intrinsics),
+                t_scale=None if image_t_scale is None else float(image_t_scale),
+                device=str(image_device),
+            )
+        )
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -156,14 +188,31 @@ def run_once(
     init_TE_values: List[float] = []
     processed = 0
 
+    sensor_frame = str(getattr(cfg.data, "sensor_frame", "lidar")).lower().strip()
     with matches_path.open("w", encoding="utf-8") as f:
         for sample in mgr.samples():
-            infra_boxes, veh_boxes, source = select_boxes(sample, use_detection=cfg.data.use_detection)
-            if filters is not None and method in {"vips", "cbm"}:
-                infra_boxes, veh_boxes = filters.apply(infra_boxes or [], veh_boxes or [])
+            method_T_true = sample.T_true
+            infra_boxes = []
+            veh_boxes = []
+            source = "image" if method == "image_match" else "groundtruth"
+            coop = None
+            if method == "image_match":
+                from legacy.v2x_calib.reader.CooperativeReader import CooperativeReader
+
+                coop = CooperativeReader(str(sample.infra_id), str(sample.veh_id), cfg.data.data_root)
+                if sensor_frame != "camera":
+                    try:
+                        method_T_true = coop.get_cooperative_camera_T_i2v()
+                    except FileNotFoundError:
+                        method_T_true = sample.T_true
+            else:
+                infra_boxes, veh_boxes, source = select_boxes(sample, use_detection=cfg.data.use_detection)
+                if filters is not None and method in {"vips", "cbm"}:
+                    infra_boxes, veh_boxes = filters.apply(infra_boxes or [], veh_boxes or [])
+
             init = build_init(
                 mode=init_mode,
-                T_true=sample.T_true,
+                T_true=method_T_true,
                 trans_std=init_trans_std,
                 rot_std_deg=init_rot_std_deg,
                 rng=rng,
@@ -171,7 +220,7 @@ def run_once(
             init_RE = init_TE = None
             if init is not None:
                 init_RE, init_TE = get_RE_TE_by_compare_T_6DOF_result_true(
-                    convert_T_to_6DOF(init.T_init), convert_T_to_6DOF(sample.T_true)
+                    convert_T_to_6DOF(init.T_init), convert_T_to_6DOF(method_T_true)
                 )
                 if init_RE is not None:
                     init_RE_values.append(float(init_RE))
@@ -184,10 +233,30 @@ def run_once(
                     init_TE=float(init_TE),
                 )
 
-            ctx = MethodContext(T_true=sample.T_true, meta={"infra_id": sample.infra_id, "veh_id": sample.veh_id})
+            ctx = MethodContext(T_true=method_T_true, meta={"infra_id": sample.infra_id, "veh_id": sample.veh_id})
             start = perf_counter()
             try:
-                res = estimator.estimate(infra_boxes, veh_boxes, init=init, ctx=ctx)
+                if method == "image_match":
+                    infra_img_path, veh_img_path = mgr._resolve_image_paths(  # type: ignore[attr-defined]
+                        int(sample.index), str(sample.infra_id), str(sample.veh_id)
+                    )
+                    if infra_img_path is None or veh_img_path is None:
+                        raise FileNotFoundError("missing image paths")
+                    if not infra_img_path.exists() or not veh_img_path.exists():
+                        raise FileNotFoundError("image file not found")
+                    K_infra = K_veh = None
+                    if coop is not None:
+                        K_infra, K_veh = coop.get_infra_vehicle_camera_instrinsics()
+                    res = estimator.estimate_from_images(
+                        infra_img_path,
+                        veh_img_path,
+                        K_src=K_infra,
+                        K_dst=K_veh,
+                        init=init,
+                        ctx=ctx,
+                    )
+                else:
+                    res = estimator.estimate(infra_boxes, veh_boxes, init=init, ctx=ctx)
             except Exception as exc:
                 res = ExtrinsicEstimate(
                     T=None,
@@ -201,6 +270,8 @@ def run_once(
             RE = float("inf") if res.RE is None else float(res.RE)
             TE = float("inf") if res.TE is None else float(res.TE)
             matches_count = int(len(res.matches or []))
+            if method == "image_match" and isinstance(res.extra, dict):
+                matches_count = int(res.extra.get("num_matches", matches_count) or matches_count)
             records.append(
                 FrameMetrics(
                     infra_id=str(sample.infra_id),
@@ -269,6 +340,25 @@ def run_once(
                 "init_rot_std_deg": float(init_rot_std_deg),
                 "init_stats": init_stats,
                 "v2xregpp_use_prior": bool(v2xregpp_use_prior) if method == "v2xregpp" else None,
+                "image_match_cfg": (
+                    {
+                        "matcher": str(image_matcher),
+                        "max_features": int(image_max_features),
+                        "ratio_test": float(image_ratio_test),
+                        "cross_check": bool(image_cross_check),
+                        "ransac_thresh_px": float(image_ransac_thresh),
+                        "ransac_confidence": float(image_ransac_confidence),
+                        "ransac_max_iters": int(image_ransac_max_iters),
+                        "min_matches": int(image_min_matches),
+                        "min_inliers": int(image_min_inliers),
+                        "resize_max_dim": int(image_resize_max_dim),
+                        "allow_no_intrinsics": bool(image_allow_no_intrinsics),
+                        "t_scale": None if image_t_scale is None else float(image_t_scale),
+                        "device": str(image_device),
+                    }
+                    if method == "image_match"
+                    else None
+                ),
                 "summary": summary,
             },
             f,
@@ -280,8 +370,8 @@ def run_once(
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate extrinsic estimators on DAIR-V2X pairs.")
-    parser.add_argument("--method", choices=["v2xregpp", "cbm", "vips"], required=True)
-    parser.add_argument("--config", default="configs/pipeline_hkust_representative.yaml")
+    parser.add_argument("--method", choices=["v2xregpp", "cbm", "vips", "image_match"], required=True)
+    parser.add_argument("--config", default="configs/hkust/pipeline_hkust_representative.yaml")
     parser.add_argument("--use-detection", action="store_true", help="Use detection cache boxes (if available).")
     parser.add_argument("--max-samples", type=int, default=None, help="Override cfg.data.max_samples; omit to use cfg.")
     parser.add_argument("--seed", type=int, default=2025)
@@ -314,6 +404,19 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Override cfg.data.detection_cache (empty string to disable).",
     )
+    parser.add_argument("--image-matcher", default="orb", choices=["orb", "sift", "loftr"])
+    parser.add_argument("--image-max-features", type=int, default=4000)
+    parser.add_argument("--image-ratio-test", type=float, default=0.75)
+    parser.add_argument("--image-cross-check", action="store_true")
+    parser.add_argument("--image-ransac-thresh", type=float, default=1.0)
+    parser.add_argument("--image-ransac-confidence", type=float, default=0.999)
+    parser.add_argument("--image-ransac-max-iters", type=int, default=2000)
+    parser.add_argument("--image-min-matches", type=int, default=20)
+    parser.add_argument("--image-min-inliers", type=int, default=15)
+    parser.add_argument("--image-resize-max-dim", type=int, default=1024)
+    parser.add_argument("--image-allow-no-intrinsics", action="store_true")
+    parser.add_argument("--image-t-scale", type=float, default=None)
+    parser.add_argument("--image-device", type=str, default="cpu")
     return parser
 
 
@@ -348,6 +451,19 @@ def main():
                     data_info_override=args.data_info_path,
                     detection_cache_override=args.detection_cache,
                     out_dir=out_dir,
+                    image_matcher=args.image_matcher,
+                    image_max_features=args.image_max_features,
+                    image_ratio_test=args.image_ratio_test,
+                    image_cross_check=args.image_cross_check,
+                    image_ransac_thresh=args.image_ransac_thresh,
+                    image_ransac_confidence=args.image_ransac_confidence,
+                    image_ransac_max_iters=args.image_ransac_max_iters,
+                    image_min_matches=args.image_min_matches,
+                    image_min_inliers=args.image_min_inliers,
+                    image_resize_max_dim=args.image_resize_max_dim,
+                    image_allow_no_intrinsics=args.image_allow_no_intrinsics,
+                    image_t_scale=args.image_t_scale,
+                    image_device=args.image_device,
                 )
                 results.append(
                     {
@@ -385,6 +501,19 @@ def main():
             data_info_override=args.data_info_path,
             detection_cache_override=args.detection_cache,
             out_dir=base_dir,
+            image_matcher=args.image_matcher,
+            image_max_features=args.image_max_features,
+            image_ratio_test=args.image_ratio_test,
+            image_cross_check=args.image_cross_check,
+            image_ransac_thresh=args.image_ransac_thresh,
+            image_ransac_confidence=args.image_ransac_confidence,
+            image_ransac_max_iters=args.image_ransac_max_iters,
+            image_min_matches=args.image_min_matches,
+            image_min_inliers=args.image_min_inliers,
+            image_resize_max_dim=args.image_resize_max_dim,
+            image_allow_no_intrinsics=args.image_allow_no_intrinsics,
+            image_t_scale=args.image_t_scale,
+            image_device=args.image_device,
         )
 
 

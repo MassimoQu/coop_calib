@@ -20,9 +20,14 @@ def _centers_xy_from_boxes(boxes: List[Any]) -> np.ndarray:
     return np.stack(centers, axis=0)
 
 
-def _pairwise_dist(centers: np.ndarray) -> np.ndarray:
+def _pairwise_dist(centers: np.ndarray, *, device: Optional[torch.device] = None) -> np.ndarray:
     if centers.size == 0:
         return np.zeros((0, 0), dtype=np.float32)
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        centers_t = torch.as_tensor(centers, dtype=torch.float32, device=device)
+        diff = centers_t[:, None, :] - centers_t[None, :, :]
+        D = torch.linalg.norm(diff, dim=2)
+        return D.detach().cpu().numpy().astype(np.float32)
     diff = centers[:, None, :] - centers[None, :, :]
     return np.linalg.norm(diff, axis=2).astype(np.float32)
 
@@ -294,6 +299,14 @@ class FreeAlignPaperConfig:
     max_step_xy_m: float = 3.0
     max_step_yaw_deg: float = 10.0
 
+    # Optional: compare against current pose and keep the better alignment.
+    compare_with_current: bool = False
+    compare_distance_threshold_m: float = 3.0
+    min_precision: float = 0.0
+    apply_if_current_precision_below: float = -1.0
+    min_precision_improvement: float = 0.0
+    min_matched_improvement: int = 0
+
     # Optional temporal alignment (search over ego time buffer).
     # time_buffer = number of historical steps (l in [t, t-τ, ..., t-lτ]); 0 disables.
     time_buffer: int = 0
@@ -327,7 +340,7 @@ class FreeAlignPaperEstimator:
 
     @torch.no_grad()
     def _edge_features(self, centers_xy: np.ndarray) -> np.ndarray:
-        D = _pairwise_dist(centers_xy)  # (N,N) float32
+        D = _pairwise_dist(centers_xy, device=self.device)  # (N,N) float32
         if not bool(self.cfg.use_gnn) or self.net is None:
             return D[..., None].astype(np.float32)  # (N,N,1)
         Dt = torch.from_numpy(D).to(self.device)
@@ -335,10 +348,15 @@ class FreeAlignPaperEstimator:
         return W
 
     @staticmethod
-    def _cdist_edges(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    def _cdist_edges(a: np.ndarray, b: np.ndarray, *, device: Optional[torch.device] = None) -> np.ndarray:
         """
         a: (N,K), b: (M,K) -> (N,M) L2 distance
         """
+        if device is not None and device.type == "cuda" and torch.cuda.is_available():
+            at = torch.as_tensor(a, dtype=torch.float32, device=device)
+            bt = torch.as_tensor(b, dtype=torch.float32, device=device)
+            d = torch.cdist(at, bt, p=2)
+            return d.detach().cpu().numpy().astype(np.float32)
         a2 = (a * a).sum(axis=1, keepdims=True)
         b2 = (b * b).sum(axis=1, keepdims=True).T
         ab = a @ b.T
@@ -356,7 +374,7 @@ class FreeAlignPaperEstimator:
         cons_thr = anchor_thr * float(self.cfg.anchor_consistency_multiplier)
 
         # Compare edge features from the seed anchor to all other nodes.
-        Di = self._cdist_edges(Wi[int(seed_i)], Wj[int(seed_j)])  # (n,m)
+        Di = self._cdist_edges(Wi[int(seed_i)], Wj[int(seed_j)], device=self.device)  # (n,m)
         Di[int(seed_i), :] = np.inf
         Di[:, int(seed_j)] = np.inf
 
@@ -394,7 +412,7 @@ class FreeAlignPaperEstimator:
         # Candidate mask: must be consistent with ALL anchors.
         ok = np.ones((n, m), dtype=bool)
         for ai, aj in anchors:
-            Dij = self._cdist_edges(Wi[:, int(ai)], Wj[:, int(aj)])  # (n,m)
+            Dij = self._cdist_edges(Wi[:, int(ai)], Wj[:, int(aj)], device=self.device)  # (n,m)
             ok &= Dij <= box_thr
         for i in used_i:
             ok[int(i), :] = False

@@ -22,7 +22,19 @@ from opencood.models.fuse_modules.pastat_fusion import PASTATFusion
 from opencood.utils.transformation_utils import normalize_pairwise_tfm
 from opencood.utils.model_utils import check_trainable_module, fix_bn, unfix_bn
 import importlib
-import torchvision
+try:
+    import torchvision
+except Exception:
+    torchvision = None
+
+
+def _center_crop_tensor(feature: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    h, w = int(feature.shape[-2]), int(feature.shape[-1])
+    target_h = max(1, min(int(target_h), h))
+    target_w = max(1, min(int(target_w), w))
+    top = max((h - target_h) // 2, 0)
+    left = max((w - target_w) // 2, 0)
+    return feature[..., top:top + target_h, left:left + target_w]
 
 class HeterModelBaseline(nn.Module):
     def __init__(self, args):
@@ -151,6 +163,10 @@ class HeterModelBaseline(nn.Module):
                                               args['compressor']['compress_ratio'])
             self.model_train_init()
 
+        # runtime feature dumping support (for stage1 export / mid-fusion descriptors)
+        self.record_runtime_features = False
+        self._runtime_feature_store = {}
+
 
         # check again which module is not fixed.
         check_trainable_module(self)
@@ -169,7 +185,6 @@ class HeterModelBaseline(nn.Module):
     def forward(self, data_dict):
         output_dict = {}
         agent_modality_list = data_dict['agent_modality_list'] 
-        affine_matrix = normalize_pairwise_tfm(data_dict['pairwise_t_matrix'], self.H, self.W, self.fake_voxel_size)
         record_len = data_dict['record_len'] 
         # print(agent_modality_list)
 
@@ -196,8 +211,11 @@ class HeterModelBaseline(nn.Module):
                     target_H = int(H*eval(f"self.crop_ratio_H_{modality_name}"))
                     target_W = int(W*eval(f"self.crop_ratio_W_{modality_name}"))
 
-                    crop_func = torchvision.transforms.CenterCrop((target_H, target_W))
-                    modality_feature_dict[modality_name] = crop_func(feature)
+                    if torchvision is not None:
+                        crop_func = torchvision.transforms.CenterCrop((target_H, target_W))
+                        modality_feature_dict[modality_name] = crop_func(feature)
+                    else:
+                        modality_feature_dict[modality_name] = _center_crop_tensor(feature, target_H, target_W)
                     if eval(f"self.depth_supervision_{modality_name}"):
                         output_dict.update({
                             f"depth_items_{modality_name}": eval(f"self.encoder_{modality_name}").depth_items
@@ -217,6 +235,21 @@ class HeterModelBaseline(nn.Module):
         
         if self.compress:
             heter_feature_2d = self.compressor(heter_feature_2d)
+
+        if self.record_runtime_features:
+            self._runtime_feature_store = {
+                'agent_bev': heter_feature_2d.detach().cpu(),
+                'record_len': record_len.detach().cpu(),
+                'agent_modality_list': list(agent_modality_list),
+            }
+
+        # Allow "no extrinsics input" runs by falling back to identity transforms.
+        pairwise_t_matrix = data_dict.get("pairwise_t_matrix")
+        if pairwise_t_matrix is None:
+            B = int(record_len.shape[0])
+            L = int(record_len.max().item())
+            pairwise_t_matrix = torch.eye(4, device=heter_feature_2d.device, dtype=heter_feature_2d.dtype).view(1, 1, 1, 4, 4).repeat(B, L, L, 1, 1)
+        affine_matrix = normalize_pairwise_tfm(pairwise_t_matrix, self.H, self.W, self.fake_voxel_size)
 
         if self.fusion_method == "pastat":
             pose_conf = data_dict.get("pose_confidence")
@@ -246,7 +279,7 @@ class HeterModelBaseline(nn.Module):
             fused_feature = self.fusion_net(heter_feature_2d,
                                             record_len,
                                             affine_matrix,
-                                            data_dict.get("pairwise_t_matrix"))
+                                            pairwise_t_matrix if "pairwise_t_matrix" in data_dict else None)
         else:
             fused_feature = self.fusion_net(heter_feature_2d, record_len, affine_matrix)
 

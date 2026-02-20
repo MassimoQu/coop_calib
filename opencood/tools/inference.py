@@ -97,8 +97,19 @@ def main():
 
     print(f"Left hand visualizing: {left_hand}")
 
-    if 'box_align' in hypes.keys():
-        hypes['box_align']['val_result'] = hypes['box_align']['test_result']
+    # When evaluating on the test set, datasets use validate_dir=test_dir and train=False,
+    # so any stage1-cache based pose correction must also point its val_result to test_result.
+    for _align_key in (
+        'box_align',
+        'v2xregpp_align',
+        'freealign_align',
+        'vips_align',
+        'cbm_align',
+        'pgc_pose',
+    ):
+        cfg = hypes.get(_align_key)
+        if isinstance(cfg, dict) and 'test_result' in cfg:
+            cfg['val_result'] = cfg['test_result']
 
     print('Creating Model')
     model = train_utils.create_model(hypes)
@@ -158,6 +169,7 @@ def main():
             continue
         with torch.no_grad():
             batch_data = train_utils.to_device(batch_data, device)
+            batch_data = train_utils.maybe_apply_pose_provider(batch_data, hypes)
             timing_payload = batch_data.get('ego', {}).get('pose_timing')
             if timing_payload:
                 def _ingest(payload):

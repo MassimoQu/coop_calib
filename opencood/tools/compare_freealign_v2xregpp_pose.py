@@ -190,23 +190,37 @@ def _transform_boxes(boxes: Sequence[object], T_cur_from_past: np.ndarray) -> Li
 
 
 def _build_time_index(stage1_cache: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    time_index: Dict[str, List[Tuple[int, str]]] = {}
+    time_index: Dict[str, Dict[str, List[Tuple[int, str]]]] = {}
     for key, entry in stage1_cache.items():
         if not isinstance(entry, dict):
             continue
+        seq_id = entry.get("sequence_id")
+        seq_key = str(seq_id) if seq_id is not None else "default"
         veh_frame = _frame_id_to_int(entry.get("veh_frame_id"))
         infra_frame = _frame_id_to_int(entry.get("infra_frame_id"))
+        frame_generic = _frame_id_to_int(entry.get("frame_id"))
+        if frame_generic is None:
+            frame_generic = _frame_id_to_int(key)
         if veh_frame is not None:
-            time_index.setdefault("vehicle", []).append((int(veh_frame), str(key)))
+            time_index.setdefault("vehicle", {}).setdefault(seq_key, []).append((int(veh_frame), str(key)))
         if infra_frame is not None:
-            time_index.setdefault("infrastructure", []).append((int(infra_frame), str(key)))
+            time_index.setdefault("infrastructure", {}).setdefault(seq_key, []).append((int(infra_frame), str(key)))
+        if frame_generic is not None:
+            time_index.setdefault("generic", {}).setdefault(seq_key, []).append((int(frame_generic), str(key)))
+
     resolved: Dict[str, Dict[str, Any]] = {}
-    for role, pairs in time_index.items():
-        pairs.sort(key=lambda x: x[0])
-        frames = [p[0] for p in pairs]
-        keys = [p[1] for p in pairs]
-        pos_map = {int(frame): int(idx) for idx, frame in enumerate(frames)}
-        resolved[str(role)] = {"frames": frames, "keys": keys, "pos_map": pos_map}
+    for role, seq_map in time_index.items():
+        role_payload: Dict[str, Any] = {"sequences": {}}
+        for seq_key, pairs in seq_map.items():
+            if not pairs:
+                continue
+            pairs.sort(key=lambda x: x[0])
+            frames = [p[0] for p in pairs]
+            keys = [p[1] for p in pairs]
+            pos_map = {int(frame): int(idx) for idx, frame in enumerate(frames)}
+            role_payload["sequences"][str(seq_key)] = {"frames": frames, "keys": keys, "pos_map": pos_map}
+        if role_payload["sequences"]:
+            resolved[str(role)] = role_payload
     return resolved
 
 
@@ -251,7 +265,7 @@ def main() -> None:
     ap.add_argument("--freealign_repo_box_error", type=float, default=0.5)
 
     # V2XReg++ config.
-    ap.add_argument("--v2xregpp_config", type=str, default="configs/pipeline_detection_pp.yaml")
+    ap.add_argument("--v2xregpp_config", type=str, default="configs/dair/detection/pipeline_detection_pp.yaml")
     ap.add_argument("--v2xregpp_detected_thr", type=float, default=None, help="Override matching.distance_thresholds.detected")
     ap.add_argument("--v2xregpp_filter_threshold", type=int, default=None, help="Override matching.filter_threshold")
     ap.add_argument("--v2xregpp_min_stability", type=float, default=0.0, help="Treat as failure if stability < this.")
@@ -367,6 +381,8 @@ def main() -> None:
             "key": key,
             "veh_frame_id": veh_frame,
             "infra_frame_id": infra_frame,
+            "frame_id": infra_entry.get("frame_id"),
+            "sequence_id": infra_entry.get("sequence_id"),
             "veh_boxes": int(veh_c.shape[0]),
             "infra_boxes": int(infra_c.shape[0]),
         }
@@ -377,9 +393,17 @@ def main() -> None:
         fa_paper_meta = {}
         time_buffer = int(args.freealign_paper_time_buffer or 0)
         if time_buffer > 0 and time_index and stage1_cache:
-            cur_frame = _frame_id_to_int(veh_frame)
-            idx_map = time_index.get("vehicle", {}).get("pos_map", {})
-            keys = time_index.get("vehicle", {}).get("keys", [])
+            role = "vehicle" if veh_frame is not None else "generic"
+            cur_frame = _frame_id_to_int(veh_frame) if veh_frame is not None else _frame_id_to_int(infra_entry.get("frame_id"))
+            if cur_frame is None:
+                cur_frame = _frame_id_to_int(key)
+            seq_id = infra_entry.get("sequence_id")
+            seq_key = str(seq_id) if seq_id is not None else "default"
+            role_info = time_index.get(role, {})
+            seq_map = role_info.get("sequences") or {}
+            seq_info = seq_map.get(seq_key) or seq_map.get("default") or {}
+            idx_map = seq_info.get("pos_map", {})
+            keys = seq_info.get("keys", [])
             pos = idx_map.get(int(cur_frame)) if cur_frame is not None else None
             if pos is not None:
                 use_clean = bool(int(args.freealign_paper_time_use_clean_pose))

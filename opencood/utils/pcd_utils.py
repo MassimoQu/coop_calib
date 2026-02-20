@@ -9,7 +9,10 @@ Utility functions related to point cloud
 
 import open3d as o3d
 import numpy as np
-from pypcd import pypcd
+try:
+    from pypcd import pypcd
+except Exception:
+    pypcd = None
 
 def pcd_to_np(pcd_file):
     """
@@ -32,7 +35,11 @@ def pcd_to_np(pcd_file):
 
     xyz = np.asarray(pcd.points)
     # we save the intensity in the first channel
-    intensity = np.expand_dims(np.asarray(pcd.colors)[:, 0], -1)
+    colors = np.asarray(pcd.colors)
+    if colors.ndim == 2 and colors.shape[0] == xyz.shape[0] and colors.shape[1] > 0:
+        intensity = np.expand_dims(colors[:, 0], -1)
+    else:
+        intensity = np.zeros((xyz.shape[0], 1), dtype=xyz.dtype)
     pcd_np = np.hstack((xyz, intensity))
 
     return np.asarray(pcd_np, dtype=np.float32)
@@ -191,7 +198,7 @@ def downsample_lidar_minimum(pcd_np_list):
     pcd_np_list : list
         Downsampled point clouds.
     """
-    minimum = np.Inf
+    minimum = np.inf
 
     for i in range(len(pcd_np_list)):
         num = pcd_np_list[i].shape[0]
@@ -203,6 +210,9 @@ def downsample_lidar_minimum(pcd_np_list):
     return pcd_np_list
 
 def read_pcd(pcd_path):
+    if pypcd is None:
+        # Fallback for environments without a py3-compatible pypcd build.
+        return pcd_to_np(pcd_path), None
     pcd = pypcd.PointCloud.from_path(pcd_path)
     time = None
     pcd_np_points = np.zeros((pcd.points, 4), dtype=np.float32)

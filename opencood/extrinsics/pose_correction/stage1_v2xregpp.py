@@ -629,6 +629,7 @@ class Stage1V2XRegPPPoseCorrector:
     max_step_xy_m: float = 3.0
     max_step_yaw_deg: float = 10.0
     freeze_ego: bool = True
+    device: Optional[str] = None
     _state: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     # Cache the estimated relative transform per (sample_idx, cav_id) so noise sweeps
     # don't re-run expensive matching/occ correlation for each noise level.
@@ -649,7 +650,8 @@ class Stage1V2XRegPPPoseCorrector:
         cfg_path = resolve_repo_path(self.config_path)
         self._cfg = load_config(str(cfg_path))
         self._filters = FilterPipeline(self._cfg.filters)
-        self._matcher = MatchingEngine(self._cfg.matching)
+        self._device = self.device
+        self._matcher = MatchingEngine(self._cfg.matching, device=self._device)
 
         mode = str(self.mode or "initfree").lower().strip()
         if mode not in {"initfree", "stable"}:
@@ -839,6 +841,7 @@ class Stage1V2XRegPPPoseCorrector:
                 inlier_threshold_m=getattr(self._cfg.solver, "inlier_threshold_m", 0.0),
                 mad_scale=getattr(self._cfg.solver, "mad_scale", 2.5),
                 min_inliers=getattr(self._cfg.solver, "min_inliers", 1),
+                device=self._device,
             )
             T6_ref = solver_ref.get_combined_extrinsic(matches2extrinsic_strategies="weightedSVD")
             T_ref = convert_6DOF_to_T(T6_ref)
@@ -929,6 +932,7 @@ class Stage1V2XRegPPPoseCorrector:
                 inlier_threshold_m=getattr(self._cfg.solver, "inlier_threshold_m", 0.0),
                 mad_scale=getattr(self._cfg.solver, "mad_scale", 2.5),
                 min_inliers=getattr(self._cfg.solver, "min_inliers", 1),
+                device=self._device,
             )
             T6 = solver.get_combined_extrinsic(matches2extrinsic_strategies=self._cfg.matching.matches2extrinsic)
             T_est = convert_6DOF_to_T(T6)
@@ -974,6 +978,7 @@ class Stage1V2XRegPPPoseCorrector:
                         inlier_threshold_m=getattr(self._cfg.solver, "inlier_threshold_m", 0.0),
                         mad_scale=getattr(self._cfg.solver, "mad_scale", 2.5),
                         min_inliers=getattr(self._cfg.solver, "min_inliers", 1),
+                        device=self._device,
                     )
                     T6_ref = solver_ref.get_combined_extrinsic(matches2extrinsic_strategies="weightedSVD")
                     T_ref = convert_6DOF_to_T(T6_ref)

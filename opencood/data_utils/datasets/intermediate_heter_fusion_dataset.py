@@ -13,6 +13,7 @@ instead of using the cooperative label.
 import random
 import math
 import time
+import os
 from collections import OrderedDict
 import numpy as np
 import torch
@@ -31,7 +32,13 @@ from opencood.utils.camera_utils import (
 )
 from opencood.utils.common_utils import merge_features_to_dict, compute_iou, convert_format
 from opencood.utils.transformation_utils import x1_to_x2, x_to_world, get_pairwise_transformation
-from opencood.utils.pose_utils import add_noise_data_dict, attach_pose_confidence
+from opencood.utils.pose_utils import (
+    add_noise_data_dict,
+    attach_pose_confidence,
+    apply_pose_overrides,
+    load_pose_override_map,
+    override_lidar_poses,
+)
 from opencood.data_utils.pre_processor import build_preprocessor
 from opencood.utils.pcd_utils import (
     mask_points_by_range,
@@ -60,8 +67,24 @@ def getIntermediateheterFusionDataset(cls):
             self.anchor_box_torch = torch.from_numpy(self.anchor_box)
 
             self.heterogeneous = True
-            self.modality_assignment = None if ('assignment_path' not in params['heter'] or params['heter']['assignment_path'] is None) \
-                                            else read_json(params['heter']['assignment_path'])
+            assignment_path = params['heter'].get('assignment_path')
+            if assignment_path is None:
+                self.modality_assignment = None
+            else:
+                resolved_path = assignment_path
+                if not os.path.isabs(str(assignment_path)):
+                    try:
+                        from opencood.extrinsics.path_utils import resolve_repo_path
+
+                        resolved_path = str(resolve_repo_path(str(assignment_path)))
+                        if not os.path.exists(resolved_path):
+                            heal_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+                            alt_path = os.path.join(heal_root, str(assignment_path))
+                            if os.path.exists(alt_path):
+                                resolved_path = alt_path
+                    except Exception:
+                        resolved_path = str(assignment_path)
+                self.modality_assignment = read_json(resolved_path)
             
             self.ego_modality = params['heter']['ego_modality'] # "m1" or "m1&m2" or "m3"
 
@@ -97,84 +120,51 @@ def getIntermediateheterFusionDataset(cls):
             self.kd_flag = params.get('kd_flag', False)
             self.pose_timing = bool(params.get("pose_timing", False))
 
-            self.box_align = False
-            if "box_align" in params:
-                self.box_align = True
-                self.stage1_result_path = params['box_align']['train_result'] if train else params['box_align']['val_result']
-                from opencood.extrinsics.path_utils import resolve_repo_path
+            # Optional: override poses to simulate missing extrinsics/localization.
+            self.pose_override_cfg = params.get("pose_override") or {}
+            if not isinstance(self.pose_override_cfg, dict):
+                self.pose_override_cfg = {}
+            self.pose_override_enabled = bool(self.pose_override_cfg.get("enabled", False))
+            self.pose_override_mode = str(self.pose_override_cfg.get("mode", "ego") or "ego")
+            self.pose_override_apply_to = str(self.pose_override_cfg.get("apply_to", "non-ego") or "non-ego")
+            self.pose_override_confidence = self.pose_override_cfg.get(
+                "set_confidence", self.pose_override_cfg.get("pose_confidence")
+            )
+            self.comm_range_use_clean_pose = bool(params.get("comm_range_use_clean_pose", self.pose_override_enabled))
+            self.pose_override_map = None
+            self.pose_override_path = (
+                self.pose_override_cfg.get("path")
+                or self.pose_override_cfg.get("pose_path")
+                or self.pose_override_cfg.get("pose_result")
+            )
+            if self.pose_override_path:
+                try:
+                    from opencood.extrinsics.path_utils import resolve_repo_path
 
-                self.stage1_result_path = str(resolve_repo_path(self.stage1_result_path))
-                self.stage1_result = read_json(self.stage1_result_path)
-                self.box_align_args = params['box_align']['args']
+                    self.pose_override_path = str(resolve_repo_path(self.pose_override_path))
+                except Exception:
+                    self.pose_override_path = str(self.pose_override_path)
+            if self.pose_override_path:
+                self.pose_override_map = load_pose_override_map(self.pose_override_path)
+                if self.pose_override_map:
+                    self.pose_override_enabled = True
+            if isinstance(self.pose_override_cfg.get("pose_map"), dict):
+                self.pose_override_map = self.pose_override_cfg.get("pose_map")
+                self.pose_override_enabled = True
+            self.pose_override_pose_field = str(
+                self.pose_override_cfg.get("pose_field") or "lidar_pose_pred_np"
+            )
+            self.pose_override_confidence_field = str(
+                self.pose_override_cfg.get("confidence_field") or "pose_confidence_np"
+            )
+            self.pose_override_freeze_ego = bool(self.pose_override_cfg.get("freeze_ego", True))
 
-            self.v2xregpp_align = False
-            if "v2xregpp_align" in params:
-                self.v2xregpp_align = True
-                cfg = params.get("v2xregpp_align") or {}
-                self.v2xregpp_stage1_result_path = cfg.get("train_result") if train else cfg.get("val_result")
-                if not self.v2xregpp_stage1_result_path:
-                    raise ValueError("v2xregpp_align requires train_result/val_result paths")
-                from opencood.extrinsics.path_utils import resolve_repo_path
-
-                self.v2xregpp_stage1_result_path = str(resolve_repo_path(self.v2xregpp_stage1_result_path))
-                self.v2xregpp_stage1_result = read_json(self.v2xregpp_stage1_result_path)
-                self.v2xregpp_align_args = cfg.get("args") or {}
-                from opencood.extrinsics.pose_correction import Stage1V2XRegPPPoseCorrector
-
-                config_path = self.v2xregpp_align_args.get("config_path")
-                if not config_path:
-                    raise ValueError("v2xregpp_align.args must include config_path (e.g., configs/pipeline_midfusion_detection_occ.yaml)")
-                self.v2xregpp_corrector = Stage1V2XRegPPPoseCorrector(**self.v2xregpp_align_args)
-
-            self.freealign_align = False
-            if "freealign_align" in params:
-                self.freealign_align = True
-                cfg = params.get("freealign_align") or {}
-                self.freealign_stage1_result_path = cfg.get("train_result") if train else cfg.get("val_result")
-                if not self.freealign_stage1_result_path:
-                    raise ValueError("freealign_align requires train_result/val_result paths")
-                from opencood.extrinsics.path_utils import resolve_repo_path
-
-                self.freealign_stage1_result_path = str(resolve_repo_path(self.freealign_stage1_result_path))
-                self.freealign_stage1_result = read_json(self.freealign_stage1_result_path)
-                self.freealign_align_args = cfg.get("args") or {}
-                backend = str(self.freealign_align_args.get("backend") or self.freealign_align_args.get("mode") or "paper").lower().strip()
-
-                from dataclasses import fields
-                from opencood.extrinsics.pose_correction import Stage1FreeAlignPoseCorrector, Stage1FreeAlignRepoPoseCorrector
-                from opencood.pose.freealign_paper import FreeAlignPaperConfig
-                from opencood.pose.freealign_repo import FreeAlignRepoConfig
-
-                if backend in {"repo", "released", "match_v7", "match_v7_with_detection"}:
-                    allowed = {f.name for f in fields(FreeAlignRepoConfig)}
-                    cfg_kwargs = {k: v for k, v in (self.freealign_align_args or {}).items() if k in allowed}
-                    self.freealign_corrector = Stage1FreeAlignRepoPoseCorrector(cfg=FreeAlignRepoConfig(**cfg_kwargs))
-                else:
-                    allowed = {f.name for f in fields(FreeAlignPaperConfig)}
-                    cfg_kwargs = {k: v for k, v in (self.freealign_align_args or {}).items() if k in allowed}
-                    ckpt_path = cfg_kwargs.get("ckpt_path")
-                    if ckpt_path:
-                        cfg_kwargs["ckpt_path"] = str(resolve_repo_path(str(ckpt_path)))
-                    self.freealign_corrector = Stage1FreeAlignPoseCorrector(cfg=FreeAlignPaperConfig(**cfg_kwargs))
-
-            self.pgc_pose = False
-            if "pgc_pose" in params:
-                self.pgc_pose = True
-                cfg = params.get("pgc_pose") or {}
-                pgc_pose_path = cfg.get("train_result") if train else cfg.get("val_result")
-                if not pgc_pose_path:
-                    raise ValueError("pgc_pose requires train_result/val_result paths")
-                from opencood.extrinsics.path_utils import resolve_repo_path
-
-                pgc_pose_path = str(resolve_repo_path(pgc_pose_path))
-                self.pgc_pose_result = read_json(pgc_pose_path)
-                self.pgc_pose_args = cfg.get("args") or {}
-                from dataclasses import fields
-                from opencood.extrinsics.pose_correction import Stage1PGCPoseCorrector
-
-                allowed = {f.name for f in fields(Stage1PGCPoseCorrector) if getattr(f, "init", False)}
-                cfg_kwargs = {k: v for k, v in (self.pgc_pose_args or {}).items() if k in allowed}
-                self.pgc_corrector = Stage1PGCPoseCorrector(**cfg_kwargs)
+        def set_pose_override_map(self, pose_map):
+            if isinstance(pose_map, dict):
+                self.pose_override_map = pose_map
+                self.pose_override_enabled = True
+            else:
+                self.pose_override_map = None
 
 
 
@@ -392,53 +382,33 @@ def getIntermediateheterFusionDataset(cls):
 
             pose_timing = {} if self.pose_timing else None
 
-            # Optional: apply pose correction before comm-range filtering so that
-            # agent inclusion/exclusion does not depend on injected pose noise.
-            v2xregpp_applied_pre_filter = False
-            freealign_applied_pre_filter = False
-            pgc_applied_pre_filter = False
-            if self.v2xregpp_align and str(idx) in self.v2xregpp_stage1_result.keys():
+            if self.pose_override_enabled:
                 t0 = time.perf_counter() if self.pose_timing else None
-                applied = self.v2xregpp_corrector.apply(
-                    sample_idx=idx,
-                    cav_id_list=list(base_data_dict.keys()),
-                    base_data_dict=base_data_dict,
-                    stage1_result=self.v2xregpp_stage1_result,
-                )
+                applied = False
+                if self.pose_override_map:
+                    applied = apply_pose_overrides(
+                        base_data_dict,
+                        override_map=self.pose_override_map,
+                        sample_idx=idx,
+                        pose_field=self.pose_override_pose_field,
+                        confidence_field=self.pose_override_confidence_field,
+                        apply_to=self.pose_override_apply_to,
+                        freeze_ego=self.pose_override_freeze_ego,
+                    )
+                else:
+                    override_lidar_poses(
+                        base_data_dict,
+                        mode=self.pose_override_mode,
+                        apply_to=self.pose_override_apply_to,
+                        ego_id=ego_id,
+                        set_confidence=self.pose_override_confidence,
+                    )
+                    applied = True
+                ego_lidar_pose = base_data_dict[ego_id]["params"]["lidar_pose"]
                 if self.pose_timing and t0 is not None and pose_timing is not None:
-                    pose_timing["v2xregpp_pre_sec"] = float(time.perf_counter() - t0)
-                    pose_timing["v2xregpp_pre_applied"] = bool(applied)
-                # Only skip the second-pass correction if we actually updated any pose.
-                v2xregpp_applied_pre_filter = bool(applied)
+                    pose_timing["pose_override_sec"] = float(time.perf_counter() - t0)
+                    pose_timing["pose_override_applied"] = bool(applied)
 
-            if self.freealign_align and str(idx) in self.freealign_stage1_result.keys():
-                t0 = time.perf_counter() if self.pose_timing else None
-                applied = self.freealign_corrector.apply(
-                    sample_idx=idx,
-                    cav_id_list=list(base_data_dict.keys()),
-                    base_data_dict=base_data_dict,
-                    stage1_result=self.freealign_stage1_result,
-                )
-                if self.pose_timing and t0 is not None and pose_timing is not None:
-                    pose_timing["freealign_pre_sec"] = float(time.perf_counter() - t0)
-                    pose_timing["freealign_pre_applied"] = bool(applied)
-                # Only skip the second-pass correction if we actually updated any pose.
-                freealign_applied_pre_filter = bool(applied)
-
-            if self.pgc_pose and str(idx) in self.pgc_pose_result:
-                t0 = time.perf_counter() if self.pose_timing else None
-                applied = self.pgc_corrector.apply(
-                    sample_idx=idx,
-                    cav_id_list=list(base_data_dict.keys()),
-                    base_data_dict=base_data_dict,
-                    pose_result=self.pgc_pose_result,
-                )
-                if self.pose_timing and t0 is not None and pose_timing is not None:
-                    pose_timing["pgc_pre_sec"] = float(time.perf_counter() - t0)
-                    pose_timing["pgc_pre_applied"] = bool(applied)
-                pgc_applied_pre_filter = bool(applied)
-
-            
             input_list_m1 = [] # can contain lidar or camera
             input_list_m2 = []
             input_list_m3 = []
@@ -466,12 +436,14 @@ def getIntermediateheterFusionDataset(cls):
             # loop over all CAVs to process information
             for cav_id, selected_cav_base in base_data_dict.items():
                 # check if the cav is within the communication range with ego
-                distance = \
-                    math.sqrt((selected_cav_base['params']['lidar_pose'][0] -
-                            ego_lidar_pose[0]) ** 2 + (
-                                    selected_cav_base['params'][
-                                        'lidar_pose'][1] - ego_lidar_pose[
-                                        1]) ** 2)
+                cav_pose_for_range = selected_cav_base['params']['lidar_pose_clean'] \
+                    if self.comm_range_use_clean_pose else selected_cav_base['params']['lidar_pose']
+                ego_pose_for_range = ego_cav_base['params']['lidar_pose_clean'] \
+                    if self.comm_range_use_clean_pose else ego_lidar_pose
+                distance = math.sqrt(
+                    (cav_pose_for_range[0] - ego_pose_for_range[0]) ** 2
+                    + (cav_pose_for_range[1] - ego_pose_for_range[1]) ** 2
+                )
 
                 # if distance is too far, we will just skip this agent
                 if distance > self.params['comm_range']:
@@ -492,72 +464,6 @@ def getIntermediateheterFusionDataset(cls):
 
             for cav_id in exclude_agent:
                 base_data_dict.pop(cav_id)
-
-            if self.pgc_pose and str(idx) in self.pgc_pose_result:
-                # Skip the second application if already applied before filtering.
-                if not pgc_applied_pre_filter:
-                    t0 = time.perf_counter() if self.pose_timing else None
-                    applied = self.pgc_corrector.apply(
-                        sample_idx=idx,
-                        cav_id_list=cav_id_list,
-                        base_data_dict=base_data_dict,
-                        pose_result=self.pgc_pose_result,
-                    )
-                    if self.pose_timing and t0 is not None and pose_timing is not None:
-                        pose_timing["pgc_post_sec"] = float(time.perf_counter() - t0)
-                        pose_timing["pgc_post_applied"] = bool(applied)
-                    if applied:
-                        lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
-
-            ########## Updated by Yifan Lu 2022.1.26 ############
-            # box align to correct pose.
-            # stage1_content contains all agent. Even out of comm range.
-            if self.box_align and str(idx) in self.stage1_result.keys():
-                from opencood.extrinsics.pose_correction import Stage1BoxAlignPoseCorrector
-
-                corrector = Stage1BoxAlignPoseCorrector(box_align_args=self.box_align_args)
-                corrected = corrector.apply(
-                    sample_idx=idx,
-                    cav_id_list=cav_id_list,
-                    base_data_dict=base_data_dict,
-                    stage1_result=self.stage1_result,
-                )
-                if corrected:
-                    lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
-
-
-            if self.v2xregpp_align and str(idx) in self.v2xregpp_stage1_result.keys():
-                # Skip the second application if we've already applied a correction before filtering.
-                if not v2xregpp_applied_pre_filter:
-                    t0 = time.perf_counter() if self.pose_timing else None
-                    corrected = self.v2xregpp_corrector.apply(
-                        sample_idx=idx,
-                        cav_id_list=cav_id_list,
-                        base_data_dict=base_data_dict,
-                        stage1_result=self.v2xregpp_stage1_result,
-                    )
-                    if self.pose_timing and t0 is not None and pose_timing is not None:
-                        pose_timing["v2xregpp_post_sec"] = float(time.perf_counter() - t0)
-                        pose_timing["v2xregpp_post_applied"] = bool(corrected)
-                    if corrected:
-                        lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
-
-            if self.freealign_align and str(idx) in self.freealign_stage1_result.keys():
-                t0 = time.perf_counter() if self.pose_timing else None
-                if not freealign_applied_pre_filter:
-                    corrected = self.freealign_corrector.apply(
-                        sample_idx=idx,
-                        cav_id_list=cav_id_list,
-                        base_data_dict=base_data_dict,
-                        stage1_result=self.freealign_stage1_result,
-                    )
-                    if self.pose_timing and t0 is not None and pose_timing is not None:
-                        pose_timing["freealign_sec"] = float(time.perf_counter() - t0)
-                        pose_timing["freealign_applied"] = bool(corrected)
-                    if corrected:
-                        lidar_pose_list = [base_data_dict[cav_id]["params"]["lidar_pose"] for cav_id in cav_id_list]
-
-
             attach_pose_confidence(base_data_dict)
             pose_confidence_list = [base_data_dict[cav_id]["params"].get("pose_confidence", 1.0) for cav_id in cav_id_list]
 

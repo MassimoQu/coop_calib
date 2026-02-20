@@ -218,6 +218,7 @@ def main():
                 continue
             with torch.no_grad():
                 batch_data = train_utils.to_device(batch_data, device)
+                batch_data = train_utils.maybe_apply_pose_provider(batch_data, hypes)
 
                 if opt.fusion_method == 'late':
                     infer_result = inference_late_fusion_heter_in_order(batch_data,

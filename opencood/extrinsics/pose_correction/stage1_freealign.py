@@ -58,6 +58,30 @@ def _limit_step_se2(
     return True
 
 
+def _compute_match_stats(src_boxes, dst_boxes, T_rel: np.ndarray, *, bbox_type: str, distance_threshold_m: float):
+    if not src_boxes or not dst_boxes:
+        return None, None
+    try:
+        from opencood.extrinsics.path_utils import ensure_v2xreg_root_on_path
+
+        ensure_v2xreg_root_on_path()
+        from v2x_calib.utils import implement_T_3dbox_object_list  # type: ignore
+        from v2x_calib.corresponding import CorrespondingDetector  # type: ignore
+    except Exception:
+        return None, None
+
+    try:
+        aligned_src = implement_T_3dbox_object_list(np.asarray(T_rel, dtype=np.float64), src_boxes)
+        bbox_key = str(bbox_type or "detected")
+        threshold = {bbox_key: float(distance_threshold_m)}
+        detector = CorrespondingDetector(aligned_src, dst_boxes, distance_threshold=threshold)
+        precision = float(detector.get_distance_corresponding_precision())
+        matched = int(detector.get_matched_num())
+        return precision, matched
+    except Exception:
+        return None, None
+
+
 def _normalize_agent_role(raw: Any) -> Optional[str]:
     if raw is None:
         return None
@@ -252,24 +276,35 @@ class Stage1FreeAlignPoseCorrector:
         if cache is not None and cache_id == id(stage1_result):
             return cache
 
-        time_index: Dict[str, List[Tuple[int, str]]] = {}
+        time_index: Dict[str, Dict[str, List[Tuple[int, str]]]] = {}
         for key, entry in stage1_result.items():
             if not isinstance(entry, Mapping):
                 continue
+            seq_id = entry.get("sequence_id")
+            seq_key = str(seq_id) if seq_id is not None else "default"
             veh_frame = _frame_id_to_int(entry.get("veh_frame_id"))
             infra_frame = _frame_id_to_int(entry.get("infra_frame_id"))
             if veh_frame is not None:
-                time_index.setdefault("vehicle", []).append((int(veh_frame), str(key)))
+                time_index.setdefault("vehicle", {}).setdefault(seq_key, []).append((int(veh_frame), str(key)))
             if infra_frame is not None:
-                time_index.setdefault("infrastructure", []).append((int(infra_frame), str(key)))
+                time_index.setdefault("infrastructure", {}).setdefault(seq_key, []).append((int(infra_frame), str(key)))
+            frame_generic = _frame_id_to_int(entry.get("frame_id"))
+            if frame_generic is not None:
+                time_index.setdefault("generic", {}).setdefault(seq_key, []).append((int(frame_generic), str(key)))
 
         resolved: Dict[str, Dict[str, Any]] = {}
-        for role, pairs in time_index.items():
-            pairs.sort(key=lambda x: x[0])
-            frames = [p[0] for p in pairs]
-            keys = [p[1] for p in pairs]
-            pos_map = {int(frame): int(idx) for idx, frame in enumerate(frames)}
-            resolved[str(role)] = {"frames": frames, "keys": keys, "pos_map": pos_map}
+        for role, seq_map in time_index.items():
+            role_payload: Dict[str, Any] = {"sequences": {}}
+            for seq_key, pairs in seq_map.items():
+                if not pairs:
+                    continue
+                pairs.sort(key=lambda x: x[0])
+                frames = [p[0] for p in pairs]
+                keys = [p[1] for p in pairs]
+                pos_map = {int(frame): int(idx) for idx, frame in enumerate(frames)}
+                role_payload["sequences"][str(seq_key)] = {"frames": frames, "keys": keys, "pos_map": pos_map}
+            if role_payload["sequences"]:
+                resolved[str(role)] = role_payload
 
         self._state["time_index"] = resolved
         self._state["time_index_id"] = id(stage1_result)
@@ -296,15 +331,28 @@ class Stage1FreeAlignPoseCorrector:
 
         time_index = self._ensure_time_index(stage1_result)
         role = _normalize_agent_role(ego_id) or _infer_dair_role_from_base(base_data_dict, ego_id)
+        if role is None and "generic" in time_index:
+            role = "generic"
         if role is None or role not in time_index:
             return None, 0.0, 0, {"reason": "missing_role"}
-        frame_field = "veh_frame_id" if role == "vehicle" else "infra_frame_id"
+        if role == "vehicle":
+            frame_field = "veh_frame_id"
+        elif role == "infrastructure":
+            frame_field = "infra_frame_id"
+        else:
+            frame_field = "frame_id"
         cur_frame = _frame_id_to_int(stage1_content.get(frame_field))
         if cur_frame is None:
             return None, 0.0, 0, {"reason": "missing_frame"}
 
-        pos_map = time_index[role]["pos_map"]
-        keys = time_index[role]["keys"]
+        seq_id = stage1_content.get("sequence_id")
+        seq_key = str(seq_id) if seq_id is not None else "default"
+        seq_map = time_index[role].get("sequences") or {}
+        seq_info = seq_map.get(seq_key) or seq_map.get("default")
+        if not seq_info:
+            return None, 0.0, 0, {"reason": "missing_sequence"}
+        pos_map = seq_info["pos_map"]
+        keys = seq_info["keys"]
         pos = pos_map.get(int(cur_frame))
         if pos is None:
             return None, 0.0, 0, {"reason": "frame_not_indexed"}
@@ -457,6 +505,45 @@ class Stage1FreeAlignPoseCorrector:
             cav_pose_current = base_data_dict[cav_id]["params"]["lidar_pose"]
             cav_T_world_current = x_to_world(cav_pose_current)
             rel_current_T = np.linalg.inv(ego_T_world) @ np.asarray(cav_T_world_current, dtype=np.float64)
+
+            compare_with_current = bool(getattr(self.cfg, "compare_with_current", False))
+            min_precision = float(getattr(self.cfg, "min_precision", 0.0) or 0.0)
+            apply_if_current_precision_below = float(
+                getattr(self.cfg, "apply_if_current_precision_below", -1.0) or -1.0
+            )
+            min_precision_improvement = float(getattr(self.cfg, "min_precision_improvement", 0.0) or 0.0)
+            min_matched_improvement = int(getattr(self.cfg, "min_matched_improvement", 0) or 0)
+            compare_threshold = float(getattr(self.cfg, "compare_distance_threshold_m", 3.0) or 0.0)
+
+            if rel_T_est is not None:
+                needs_compare = compare_with_current or min_precision > 0.0 or apply_if_current_precision_below >= 0.0 \
+                    or min_precision_improvement > 0.0 or min_matched_improvement > 0
+                if needs_compare:
+                    ego_boxes_eval = _extract_boxes(stage1_content, agent_idx=ego_idx, bbox_type=self.bbox_type)
+                    cav_boxes_eval = _extract_boxes(stage1_content, agent_idx=cav_idx, bbox_type=self.bbox_type)
+                    est_precision, est_matched = _compute_match_stats(
+                        ego_boxes_eval, cav_boxes_eval, rel_T_est,
+                        bbox_type=self.bbox_type, distance_threshold_m=compare_threshold
+                    )
+                    if est_precision is None or est_matched is None:
+                        rel_T_est = None
+                    else:
+                        if min_precision > 0.0 and float(est_precision) < float(min_precision):
+                            rel_T_est = None
+                        else:
+                            cur_precision, cur_matched = _compute_match_stats(
+                                ego_boxes_eval, cav_boxes_eval, rel_current_T,
+                                bbox_type=self.bbox_type, distance_threshold_m=compare_threshold
+                            )
+                            if cur_precision is not None and cur_matched is not None:
+                                if apply_if_current_precision_below >= 0.0:
+                                    if int(cur_matched) > 0 and float(cur_precision) > float(apply_if_current_precision_below):
+                                        rel_T_est = None
+                                if rel_T_est is not None and int(cur_matched) > 0:
+                                    precision_ok = float(est_precision) >= float(cur_precision) + float(min_precision_improvement)
+                                    matched_ok = int(est_matched) >= int(cur_matched) + int(min_matched_improvement)
+                                    if not (precision_ok or matched_ok):
+                                        rel_T_est = None
 
             rel_T_corrected: Optional[np.ndarray]
             if not stable:
@@ -625,6 +712,45 @@ class Stage1FreeAlignRepoPoseCorrector:
             cav_pose_current = base_data_dict[cav_id]["params"]["lidar_pose"]
             cav_T_world_current = x_to_world(cav_pose_current)
             rel_current_T = np.linalg.inv(ego_T_world) @ np.asarray(cav_T_world_current, dtype=np.float64)
+
+            compare_with_current = bool(getattr(self.cfg, "compare_with_current", False))
+            min_precision = float(getattr(self.cfg, "min_precision", 0.0) or 0.0)
+            apply_if_current_precision_below = float(
+                getattr(self.cfg, "apply_if_current_precision_below", -1.0) or -1.0
+            )
+            min_precision_improvement = float(getattr(self.cfg, "min_precision_improvement", 0.0) or 0.0)
+            min_matched_improvement = int(getattr(self.cfg, "min_matched_improvement", 0) or 0)
+            compare_threshold = float(getattr(self.cfg, "compare_distance_threshold_m", 3.0) or 0.0)
+
+            if rel_T_est is not None:
+                needs_compare = compare_with_current or min_precision > 0.0 or apply_if_current_precision_below >= 0.0 \
+                    or min_precision_improvement > 0.0 or min_matched_improvement > 0
+                if needs_compare:
+                    ego_boxes_eval = _extract_boxes(stage1_content, agent_idx=ego_idx, bbox_type=self.bbox_type)
+                    cav_boxes_eval = _extract_boxes(stage1_content, agent_idx=cav_idx, bbox_type=self.bbox_type)
+                    est_precision, est_matched = _compute_match_stats(
+                        ego_boxes_eval, cav_boxes_eval, rel_T_est,
+                        bbox_type=self.bbox_type, distance_threshold_m=compare_threshold
+                    )
+                    if est_precision is None or est_matched is None:
+                        rel_T_est = None
+                    else:
+                        if min_precision > 0.0 and float(est_precision) < float(min_precision):
+                            rel_T_est = None
+                        else:
+                            cur_precision, cur_matched = _compute_match_stats(
+                                ego_boxes_eval, cav_boxes_eval, rel_current_T,
+                                bbox_type=self.bbox_type, distance_threshold_m=compare_threshold
+                            )
+                            if cur_precision is not None and cur_matched is not None:
+                                if apply_if_current_precision_below >= 0.0:
+                                    if int(cur_matched) > 0 and float(cur_precision) > float(apply_if_current_precision_below):
+                                        rel_T_est = None
+                                if rel_T_est is not None and int(cur_matched) > 0:
+                                    precision_ok = float(est_precision) >= float(cur_precision) + float(min_precision_improvement)
+                                    matched_ok = int(est_matched) >= int(cur_matched) + int(min_matched_improvement)
+                                    if not (precision_ok or matched_ok):
+                                        rel_T_est = None
 
             rel_T_corrected: Optional[np.ndarray]
             if not stable:
