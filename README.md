@@ -55,6 +55,9 @@ Next: decide whether to integrate or keep as a reference-only subtree.
 
 - Pose cache tooling and PGC inference: `opencood/tools/train_v2vloc_pgc.py`, `opencood/tools/infer_v2vloc_pgc_pose.py`, `opencood/tools/eval_pgc_pose_json.py`, plus `opencood/pose/pgc.py` RSD + RANSAC.
 - Pose-correction bridge for cached PGC output: `opencood/extrinsics/pose_correction/stage1_pgc_pose.py`.
+- Pose solver decoupled from dataset: `opencood/extrinsics/pose_correction/pose_solver.py` + `opencood/utils/pose_utils.py:apply_pose_overrides`.
+- Image-based pose estimation (ORB/SIFT/LoFTR/DISK/LightGlue + essential matrix): `opencood/extrinsics/late_fusion/image_matching.py`, optional eval via `opencood/tools/run_extrinsic_benchmark.py --method image_match`.
+- LiDAR registration (FPFH + RANSAC/FGR + ICP): `opencood/extrinsics/late_fusion/lidar_registration.py`.
 - Scenario filtering for OPV2V: `opencood/data_utils/datasets/basedataset/opv2v_basedataset.py` supports `scenario_list` / `scenario_blacklist`.
 - DAIR-V2X data_info overrides + pair disambiguation: `opencood/data_utils/datasets/basedataset/dairv2x_basedataset.py`.
 - V2V4Real multi-ego dataset class + configs: `opencood/data_utils/datasets/basedataset/v2v4real_basedataset.py`, `opencood/hypes_yaml/v2v4real/`.
